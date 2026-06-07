@@ -9,7 +9,9 @@ from .src.customknight_creator import (
     NODE_DISPLAY_NAME_MAPPINGS,
 )
 
-# Folder (relative to this file) that ComfyUI serves JS extensions from.
-WEB_DIRECTORY = "./web"
+# Folder (relative to this file) that directly contains the JS extension
+# files. ComfyUI serves each file at /extensions/<module>/<file>, so the JS
+# imports resolve "../../scripts/app.js" -> "/scripts/app.js".
+WEB_DIRECTORY = "./web/js"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

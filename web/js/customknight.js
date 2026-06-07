@@ -7,6 +7,10 @@
  *   - a "Refresh" button to (re)load collections from disk,
  *   - an animated preview that plays the selected animation's frames, with
  *     play/pause and a frame scrubber.
+ *
+ * The preview is drawn as a LiteGraph custom widget (not a DOM element), so it
+ * is laid out and clipped by the node itself and keeps a constant aspect ratio
+ * as the node is resized.
  */
 
 import { app } from "../../scripts/app.js";
@@ -14,6 +18,12 @@ import { api } from "../../scripts/api.js";
 
 const PLACEHOLDER = "<refresh>";
 const NODE_NAME = "CKAnimationSelector";
+
+// Preview box height as a fraction of its width. Keeping this constant means
+// the preview area's aspect ratio stays fixed when the node is resized.
+const PREVIEW_ASPECT = 1.0;
+const PREVIEW_MIN_HEIGHT = 120;
+const PREVIEW_MARGIN = 8;
 
 async function getJSON(url, params) {
   const qs = new URLSearchParams(params).toString();
@@ -40,11 +50,25 @@ function setComboValues(widget, values, keepValue) {
   if (!widget) return;
   const list = values && values.length ? values : [PLACEHOLDER];
   widget.options.values = list;
-  if (keepValue && list.includes(widget.value)) {
-    // leave as-is
-  } else {
+  if (!(keepValue && list.includes(widget.value))) {
     widget.value = list[0];
   }
+}
+
+// --- transparency checkerboard pattern (created lazily, cached) ------------
+let _checker = null;
+function checkerPattern(ctx) {
+  if (_checker) return _checker;
+  const c = document.createElement("canvas");
+  c.width = c.height = 16;
+  const cx = c.getContext("2d");
+  cx.fillStyle = "#3a3a3a";
+  cx.fillRect(0, 0, 16, 16);
+  cx.fillStyle = "#2b2b2b";
+  cx.fillRect(0, 0, 8, 8);
+  cx.fillRect(8, 8, 8, 8);
+  _checker = ctx.createPattern(c, "repeat");
+  return _checker;
 }
 
 app.registerExtension({
@@ -75,25 +99,6 @@ function setupSelectorNode(node) {
     timer: null,
   };
 
-  // --- preview canvas (DOM widget) ----------------------------------------
-  const canvas = document.createElement("canvas");
-  canvas.width = 256;
-  canvas.height = 256;
-  canvas.style.width = "100%";
-  canvas.style.borderRadius = "6px";
-  canvas.style.background =
-    "repeating-conic-gradient(#444 0% 25%, #333 0% 50%) 50% / 16px 16px";
-  canvas.style.imageRendering = "pixelated";
-
-  const previewWidget = node.addDOMWidget("ck_preview", "preview", canvas, {
-    serialize: false,
-    hideOnZoom: false,
-  });
-  previewWidget.computeSize = function (width) {
-    return [width, 220];
-  };
-  node._ckCanvas = canvas;
-
   // --- control widgets -----------------------------------------------------
   node.addWidget("button", "Refresh", null, () => reloadCollections(node), {
     serialize: false,
@@ -109,7 +114,7 @@ function setupSelectorNode(node) {
     { on: "playing", off: "paused", serialize: false }
   );
 
-  const frameWidget = node.addWidget(
+  node.addWidget(
     "slider",
     "frame",
     0,
@@ -119,29 +124,62 @@ function setupSelectorNode(node) {
         p.index = Math.max(0, Math.min(p.images.length - 1, Math.round(v)));
         p.playing = false;
         playWidget.value = false;
-        drawPreview(node);
+        node.setDirtyCanvas(true, false);
       }
     },
     { min: 0, max: 0, step: 1, precision: 0, serialize: false }
   );
-  node._ckFrameWidget = frameWidget;
+  node._ckFrameWidget = findWidget(node, "frame");
+
+  // --- preview widget (drawn by LiteGraph, last so it sits at the bottom) ---
+  addPreviewWidget(node);
 
   // --- wire change handlers ------------------------------------------------
   hookWidget(collectionWidget, () => reloadAnimations(node));
   hookWidget(animationWidget, () => reloadFrames(node));
 
-  // Reload collections when the user finishes editing the root folders box.
-  if (rootWidget?.inputEl) {
-    rootWidget.inputEl.addEventListener("change", () => reloadCollections(node));
-    rootWidget.inputEl.addEventListener("blur", () => reloadCollections(node));
-  }
-
   startPreviewLoop(node);
 
-  // Populate on next tick if root folders were restored from a saved graph.
+  // The multiline textarea (inputEl) may be created lazily, so attach the
+  // change/blur listeners on the next tick. Also auto-load once if the root
+  // folders were restored from a saved graph, and normalise the node height
+  // (fixes nodes that were left oversized by an earlier build). The Refresh
+  // button always works regardless.
   setTimeout(() => {
+    const el = rootWidget?.inputEl;
+    if (el && !el._ckHooked) {
+      el._ckHooked = true;
+      el.addEventListener("change", () => reloadCollections(node));
+      el.addEventListener("blur", () => reloadCollections(node));
+    }
+    const size = node.computeSize();
+    node.setSize([Math.max(node.size[0], size[0]), size[1]]);
+    node.setDirtyCanvas(true, true);
     if (rootWidget?.value?.trim()) reloadCollections(node);
-  }, 50);
+  }, 100);
+}
+
+function addPreviewWidget(node) {
+  const widget = {
+    name: "ck_preview",
+    type: "ckpreview",
+    value: "",
+    options: { serialize: false },
+    computeSize(width) {
+      const h = Math.max(PREVIEW_MIN_HEIGHT, Math.round(width * PREVIEW_ASPECT));
+      return [width, h];
+    },
+    draw(ctx, n, width, y) {
+      const x = PREVIEW_MARGIN;
+      const w = width - PREVIEW_MARGIN * 2;
+      const h = this.computeSize(width)[1] - PREVIEW_MARGIN;
+      if (w <= 0 || h <= 0) return;
+      drawPreview(ctx, node, x, y, w, h);
+    },
+  };
+  if (node.addCustomWidget) node.addCustomWidget(widget);
+  else (node.widgets ||= []).push(widget);
+  node._ckPreviewWidget = widget;
 }
 
 function hookWidget(widget, cb) {
@@ -205,12 +243,15 @@ async function reloadFrames(node) {
     p.index = 0;
     p.images = frames.map((f) => {
       const img = new Image();
+      img.onload = () => node.setDirtyCanvas(true, false);
       img.src = imageURL(root, f.path);
       return img;
     });
-    node._ckFrameWidget.options.max = Math.max(0, frames.length - 1);
-    node._ckFrameWidget.value = 0;
-    drawPreview(node);
+    if (node._ckFrameWidget) {
+      node._ckFrameWidget.options.max = Math.max(0, frames.length - 1);
+      node._ckFrameWidget.value = 0;
+    }
+    node.setDirtyCanvas(true, false);
   } catch (e) {
     toast(node, `Frames: ${e.message}`);
   }
@@ -223,7 +264,7 @@ function startPreviewLoop(node) {
     if (!p.playing || p.images.length === 0) return;
     p.index = (p.index + 1) % p.images.length;
     if (node._ckFrameWidget) node._ckFrameWidget.value = p.index;
-    drawPreview(node);
+    node.setDirtyCanvas(true, false);
   }, 1000 / p.fps);
 
   const onRemoved = node.onRemoved;
@@ -233,39 +274,52 @@ function startPreviewLoop(node) {
   };
 }
 
-function drawPreview(node) {
-  const canvas = node._ckCanvas;
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
+/** Draw the current frame into the rect (x, y, w, h) in node-local coords. */
+function drawPreview(ctx, node, x, y, w, h) {
   const p = node._ckPreview;
-  const img = p.images[p.index];
 
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+
+  // transparency checkerboard
+  ctx.fillStyle = checkerPattern(ctx) || "#2b2b2b";
+  ctx.fillRect(x, y, w, h);
+
+  const img = p.images[p.index];
   if (!img || !img.complete || !img.naturalWidth) {
     ctx.fillStyle = "#aaa";
     ctx.font = "13px sans-serif";
     ctx.textAlign = "center";
-    ctx.fillText("no animation selected", canvas.width / 2, canvas.height / 2);
+    ctx.textBaseline = "middle";
+    ctx.fillText("no animation selected", x + w / 2, y + h / 2);
+    ctx.restore();
     return;
   }
 
-  // Fit the frame inside the canvas, preserving aspect ratio.
-  const scale = Math.min(
-    canvas.width / img.naturalWidth,
-    canvas.height / img.naturalHeight
-  );
-  const w = img.naturalWidth * scale;
-  const h = img.naturalHeight * scale;
+  // Fit the frame inside the rect, preserving aspect ratio.
+  const scale = Math.min(w / img.naturalWidth, h / img.naturalHeight);
+  const dw = img.naturalWidth * scale;
+  const dh = img.naturalHeight * scale;
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(img, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+  try {
+    ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  } catch (e) {
+    /* image not ready yet */
+  }
 
+  // frame counter overlay
   ctx.fillStyle = "rgba(0,0,0,0.55)";
-  ctx.fillRect(0, canvas.height - 18, canvas.width, 18);
+  ctx.fillRect(x, y + h - 16, w, 16);
   ctx.fillStyle = "#fff";
-  ctx.font = "12px monospace";
+  ctx.font = "11px monospace";
   ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
   const name = p.frames[p.index]?.name || "";
-  ctx.fillText(`${p.index + 1}/${p.images.length}  ${name}`, 6, canvas.height - 5);
+  ctx.fillText(`${p.index + 1}/${p.images.length}  ${name}`, x + 5, y + h - 8);
+
+  ctx.restore();
 }
 
 function toast(node, message) {
