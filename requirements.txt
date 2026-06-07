@@ -1,0 +1,4 @@
+# Runtime dependencies not already shipped with ComfyUI.
+# (torch / numpy / aiohttp come with ComfyUI.)
+pillow>=9.0
+numpy>=1.23

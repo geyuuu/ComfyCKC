@@ -1,0 +1,56 @@
+[project]
+name = "comfyui-customknight-creator"
+version = "1.0.0"
+description = "ComfyUI nodes to select, preview and repack Hollow Knight CustomKnight sprite atlases - a node port of CustomKnight-Creator."
+authors = [{ name = "CustomKnight Creator contributors" }]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+keywords = ["comfyui", "hollow-knight", "customknight", "sprite", "atlas", "modding"]
+
+# Runtime dependencies that ComfyUI does NOT already provide.
+# (torch, numpy and the aiohttp server ship with ComfyUI, so they are not
+# pinned here; numpy is listed because the nodes import it directly.)
+dependencies = [
+    "pillow>=9.0",
+    "numpy>=1.23",
+]
+
+[project.urls]
+Repository = "https://github.com/cmot17/CustomKnight-Creator"
+
+# ComfyUI Registry metadata (https://docs.comfy.org/registry/specifications).
+[tool.comfy]
+PublisherId = ""
+DisplayName = "CustomKnight Creator"
+Icon = ""
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/customknight_creator"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"web" = "customknight_creator/web"
+
+# ---- uv -------------------------------------------------------------------
+# Development tooling. `dev` stays lightweight (no torch) so the core sprite
+# logic can be tested quickly; the `comfy` group adds torch for importing the
+# node classes themselves, mirroring what the ComfyUI host provides.
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+comfy = [
+    "torch>=2.0",
+]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
