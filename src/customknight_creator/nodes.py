@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 
 import numpy as np
 import torch
@@ -50,6 +51,18 @@ _COMBO_PLACEHOLDER = "<refresh>"
 def pil_to_tensor(img: Image.Image) -> torch.Tensor:
     """RGB ``[1, H, W, 3]`` float tensor in ``[0, 1]``."""
     arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+    return torch.from_numpy(arr)[None, ...]
+
+
+def pil_rgba_to_tensor(img: Image.Image) -> torch.Tensor:
+    """RGBA ``[1, H, W, 4]`` float tensor in ``[0, 1]``.
+
+    Keeps the alpha channel so the output IMAGE renders with transparency in a
+    downstream Preview/Save node, matching the saved atlas PNG. Dropping alpha
+    here (``convert("RGB")``) would expose the arbitrary RGB that sprite atlases
+    leave in fully-transparent texels (white boxes / colour noise).
+    """
+    arr = np.asarray(img.convert("RGBA"), dtype=np.float32) / 255.0
     return torch.from_numpy(arr)[None, ...]
 
 
@@ -359,12 +372,24 @@ class CKPackAtlas:
             size = (override_width, override_height)
 
         result = pack_collection(project, collection, replacements, size)
-        atlas_tensor = pil_to_tensor(result.image)  # RGB preview / output
+        # Keep alpha: the atlas is transparent, and the output IMAGE must match
+        # the saved PNG shown in the node's thumbnail.
+        atlas_tensor = pil_rgba_to_tensor(result.image)
 
+        # Always produce a thumbnail for the node. When saving to output we
+        # persist it there; otherwise we write a throwaway copy to ComfyUI's
+        # temp folder purely so the in-node preview shows up regardless of the
+        # save_to_output toggle.
         saved_path = ""
         ui = {}
         if save_to_output:
-            saved_path, ui = self._save_output(result.image, filename_prefix, collection)
+            saved_path, ui = self._save_image(
+                result.image, f"{filename_prefix}_{collection}", "output"
+            )
+        else:
+            _, ui = self._save_image(
+                result.image, self._temp_prefix(collection), "temp"
+            )
 
         if external_directory.strip():
             ext_dir = external_directory.strip().strip('"')
@@ -377,11 +402,27 @@ class CKPackAtlas:
         return {"ui": ui, "result": (atlas_tensor, saved_path)}
 
     @staticmethod
-    def _save_output(image: Image.Image, filename_prefix: str, collection: str):
+    def _temp_prefix(collection: str) -> str:
+        """A per-run prefix so temp previews don't clash between executions."""
+        rand = "".join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
+        return f"ckatlas_preview_{collection}_{rand}"
+
+    @staticmethod
+    def _save_image(image: Image.Image, prefix: str, type_: str):
+        """Save ``image`` under the output (``type_="output"``) or temp
+        (``type_="temp"``) directory and return ``(path, ui_dict)``.
+
+        The ``ui_dict`` is what makes ComfyUI render the thumbnail on the node.
+        Returns ``("", {})`` when ComfyUI's ``folder_paths`` isn't importable
+        (e.g. unit tests outside a ComfyUI host).
+        """
         if folder_paths is None:
             return "", {}
-        out_dir = folder_paths.get_output_directory()
-        prefix = f"{filename_prefix}_{collection}"
+        out_dir = (
+            folder_paths.get_output_directory()
+            if type_ == "output"
+            else folder_paths.get_temp_directory()
+        )
         full_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
             prefix, out_dir, image.width, image.height
         )
@@ -389,7 +430,7 @@ class CKPackAtlas:
         path = os.path.join(full_folder, file)
         image.save(path)
         return path, {
-            "images": [{"filename": file, "subfolder": subfolder, "type": "output"}]
+            "images": [{"filename": file, "subfolder": subfolder, "type": type_}]
         }
 
 

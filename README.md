@@ -47,7 +47,11 @@ modified frames are dropped in place, every other sprite of the collection is
 read from disk unchanged, and the whole thing is packed — applying the same
 crop / 90° rotation / flip and power-of-two sizing as the original packer.
 
-- Saves a preview into ComfyUI's `output/` folder.
+- The `atlas` output is an RGBA `IMAGE`, so its transparency previews exactly
+  like the saved PNG (no white boxes / colour noise from dropped alpha).
+- A thumbnail always renders on the node. `save_to_output` only controls whether
+  the PNG is persisted to ComfyUI's `output/` folder (on) or written to the
+  temp folder for preview only (off).
 - Optional `external_directory` also writes `<collection>.png` straight into
   your CustomKnight skin folder.
 - `override_width` / `override_height` force exact atlas dimensions if needed.

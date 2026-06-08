@@ -8,9 +8,11 @@
  *   - an animated preview that plays the selected animation's frames, with
  *     play/pause and a frame scrubber.
  *
- * The preview is drawn as a LiteGraph custom widget (not a DOM element), so it
- * is laid out and clipped by the node itself and keeps a constant aspect ratio
- * as the node is resized.
+ * The preview is a <canvas> mounted as a DOM widget (addDOMWidget) so it
+ * renders under both the classic LiteGraph canvas renderer and the Vue-based
+ * "Modern Node Design" (Nodes 2.0) renderer, keeping a constant aspect ratio
+ * as the node is resized. (A legacy canvas-drawn widget is kept as a fallback
+ * for ComfyUI builds old enough to lack addDOMWidget.)
  */
 
 import { app } from "../../scripts/app.js";
@@ -55,20 +57,29 @@ function setComboValues(widget, values, keepValue) {
   }
 }
 
-// --- transparency checkerboard pattern (created lazily, cached) ------------
-let _checker = null;
+// --- transparency checkerboard pattern -------------------------------------
+// A CanvasPattern belongs to the context that created it, and each DOM-widget
+// node owns its own canvas/context, so cache one pattern per context (the
+// 16x16 source tile is built once and shared).
+let _checkerTile = null;
+const _checkerPatterns = new WeakMap();
 function checkerPattern(ctx) {
-  if (_checker) return _checker;
-  const c = document.createElement("canvas");
-  c.width = c.height = 16;
-  const cx = c.getContext("2d");
-  cx.fillStyle = "#3a3a3a";
-  cx.fillRect(0, 0, 16, 16);
-  cx.fillStyle = "#2b2b2b";
-  cx.fillRect(0, 0, 8, 8);
-  cx.fillRect(8, 8, 8, 8);
-  _checker = ctx.createPattern(c, "repeat");
-  return _checker;
+  let pattern = _checkerPatterns.get(ctx);
+  if (pattern) return pattern;
+  if (!_checkerTile) {
+    const c = document.createElement("canvas");
+    c.width = c.height = 16;
+    const cx = c.getContext("2d");
+    cx.fillStyle = "#3a3a3a";
+    cx.fillRect(0, 0, 16, 16);
+    cx.fillStyle = "#2b2b2b";
+    cx.fillRect(0, 0, 8, 8);
+    cx.fillRect(8, 8, 8, 8);
+    _checkerTile = c;
+  }
+  pattern = ctx.createPattern(_checkerTile, "repeat");
+  _checkerPatterns.set(ctx, pattern);
+  return pattern;
 }
 
 app.registerExtension({
@@ -124,14 +135,14 @@ function setupSelectorNode(node) {
         p.index = Math.max(0, Math.min(p.images.length - 1, Math.round(v)));
         p.playing = false;
         playWidget.value = false;
-        node.setDirtyCanvas(true, false);
+        renderPreview(node);
       }
     },
     { min: 0, max: 0, step: 1, precision: 0, serialize: false }
   );
   node._ckFrameWidget = findWidget(node, "frame");
 
-  // --- preview widget (drawn by LiteGraph, last so it sits at the bottom) ---
+  // --- preview widget (added last so it sits at the bottom of the node) ----
   addPreviewWidget(node);
 
   // --- wire change handlers ------------------------------------------------
@@ -155,26 +166,95 @@ function setupSelectorNode(node) {
     const size = node.computeSize();
     node.setSize([Math.max(node.size[0], size[0]), size[1]]);
     node.setDirtyCanvas(true, true);
+    renderPreview(node); // draw the placeholder before any frames load
     if (rootWidget?.value?.trim()) reloadCollections(node);
   }, 100);
 }
 
+// Reserve a preview area of constant aspect ratio under the node's width.
+function previewHeightFor(width) {
+  const w = width || PREVIEW_MIN_HEIGHT;
+  return Math.max(PREVIEW_MIN_HEIGHT, Math.round(w * PREVIEW_ASPECT));
+}
+
 function addPreviewWidget(node) {
+  // Prefer a real DOM widget: the "Modern Node Design" (Nodes 2.0) renderer is
+  // Vue/DOM based and no longer paints custom canvas-drawn widgets, so a plain
+  // `draw(ctx)` widget shows up blank/broken there. A `<canvas>` mounted via
+  // addDOMWidget renders correctly under BOTH the classic and Nodes 2.0
+  // renderers. Fall back to the legacy canvas widget only on very old ComfyUI.
+  if (node.addDOMWidget) {
+    // ComfyUI lays out (and, in Nodes 2.0, measures) the *widget element* to
+    // size the slot. Hand it a plain <div>: a <div> has no intrinsic size, so
+    // nothing we paint can feed back into the layout. The <canvas> lives
+    // *inside* it, absolutely positioned to fill it. Because the canvas is out
+    // of flow, resizing its backing store never changes the <div>'s measured
+    // height -- which is exactly what used to loop with the ResizeObserver and
+    // make the preview slowly grow/shrink while zooming under Nodes 2.0.
+    const wrap = document.createElement("div");
+    Object.assign(wrap.style, {
+      position: "relative",
+      width: "100%",
+      // Guarantee a visible height even if the Nodes 2.0 layout sizes the
+      // widget slot by content rather than by computeSize().
+      minHeight: `${PREVIEW_MIN_HEIGHT}px`,
+      boxSizing: "border-box",
+    });
+
+    const canvas = document.createElement("canvas");
+    Object.assign(canvas.style, {
+      position: "absolute",
+      inset: "0",
+      display: "block",
+      borderRadius: "4px",
+      backgroundColor: "#2b2b2b",
+      // Non-interactive: let clicks/drags fall through to the node.
+      pointerEvents: "none",
+    });
+    wrap.appendChild(canvas);
+    node._ckCanvas = canvas;
+
+    const widget = node.addDOMWidget("ck_preview", "ckpreview", wrap, {
+      serialize: false,
+      hideOnZoom: false,
+    });
+    widget.computeSize = function (width) {
+      const w = width || node.size?.[0] || PREVIEW_MIN_HEIGHT;
+      return [w, previewHeightFor(w)];
+    };
+    node._ckPreviewWidget = widget;
+
+    // Repaint crisply whenever the slot (and thus the canvas) is resized.
+    // Observe the wrapper, not the canvas: the wrapper's size is driven purely
+    // by the layout, so its resize signal can't loop back through our paint.
+    if (typeof ResizeObserver !== "undefined") {
+      node._ckResizeObserver = new ResizeObserver(() => renderPreview(node));
+      node._ckResizeObserver.observe(wrap);
+    }
+    return;
+  }
+
+  // --- legacy fallback: canvas-drawn LiteGraph widget ----------------------
   const widget = {
     name: "ck_preview",
     type: "ckpreview",
     value: "",
     options: { serialize: false },
     computeSize(width) {
-      const h = Math.max(PREVIEW_MIN_HEIGHT, Math.round(width * PREVIEW_ASPECT));
-      return [width, h];
+      return [width, previewHeightFor(width)];
     },
     draw(ctx, n, width, y) {
       const x = PREVIEW_MARGIN;
       const w = width - PREVIEW_MARGIN * 2;
       const h = this.computeSize(width)[1] - PREVIEW_MARGIN;
       if (w <= 0 || h <= 0) return;
-      drawPreview(ctx, node, x, y, w, h);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(x, y, w, h);
+      ctx.clip();
+      ctx.translate(x, y);
+      drawPreviewInto(ctx, node, w, h);
+      ctx.restore();
     },
   };
   if (node.addCustomWidget) node.addCustomWidget(widget);
@@ -243,7 +323,7 @@ async function reloadFrames(node) {
     p.index = 0;
     p.images = frames.map((f) => {
       const img = new Image();
-      img.onload = () => node.setDirtyCanvas(true, false);
+      img.onload = () => renderPreview(node);
       img.src = imageURL(root, f.path);
       return img;
     });
@@ -251,7 +331,7 @@ async function reloadFrames(node) {
       node._ckFrameWidget.options.max = Math.max(0, frames.length - 1);
       node._ckFrameWidget.value = 0;
     }
-    node.setDirtyCanvas(true, false);
+    renderPreview(node);
   } catch (e) {
     toast(node, `Frames: ${e.message}`);
   }
@@ -264,28 +344,45 @@ function startPreviewLoop(node) {
     if (!p.playing || p.images.length === 0) return;
     p.index = (p.index + 1) % p.images.length;
     if (node._ckFrameWidget) node._ckFrameWidget.value = p.index;
-    node.setDirtyCanvas(true, false);
+    renderPreview(node);
   }, 1000 / p.fps);
 
   const onRemoved = node.onRemoved;
   node.onRemoved = function () {
     if (p.timer) clearInterval(p.timer);
+    node._ckResizeObserver?.disconnect();
     onRemoved?.apply(this, arguments);
   };
 }
 
-/** Draw the current frame into the rect (x, y, w, h) in node-local coords. */
-function drawPreview(ctx, node, x, y, w, h) {
+/** Repaint the preview for the current frame.
+ *
+ * With a DOM widget we own a real <canvas> and draw straight onto it. With the
+ * legacy canvas widget we just flag the LiteGraph canvas dirty and its `draw`
+ * handler calls drawPreviewInto for us.
+ */
+function renderPreview(node) {
+  const canvas = node._ckCanvas;
+  if (!canvas) {
+    node.setDirtyCanvas(true, false);
+    return;
+  }
+  // Match the backing store to the element's displayed size for crisp output.
+  const cw = Math.max(1, Math.round(canvas.clientWidth || canvas.width || 1));
+  const ch = Math.max(1, Math.round(canvas.clientHeight || canvas.height || 1));
+  if (canvas.width !== cw) canvas.width = cw;
+  if (canvas.height !== ch) canvas.height = ch;
+  drawPreviewInto(canvas.getContext("2d"), node, cw, ch);
+}
+
+/** Draw the current frame into the rect (0, 0, w, h) of `ctx`. */
+function drawPreviewInto(ctx, node, w, h) {
   const p = node._ckPreview;
 
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(x, y, w, h);
-  ctx.clip();
-
   // transparency checkerboard
+  ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = checkerPattern(ctx) || "#2b2b2b";
-  ctx.fillRect(x, y, w, h);
+  ctx.fillRect(0, 0, w, h);
 
   const img = p.images[p.index];
   if (!img || !img.complete || !img.naturalWidth) {
@@ -293,8 +390,7 @@ function drawPreview(ctx, node, x, y, w, h) {
     ctx.font = "13px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("no animation selected", x + w / 2, y + h / 2);
-    ctx.restore();
+    ctx.fillText("no animation selected", w / 2, h / 2);
     return;
   }
 
@@ -304,22 +400,20 @@ function drawPreview(ctx, node, x, y, w, h) {
   const dh = img.naturalHeight * scale;
   ctx.imageSmoothingEnabled = false;
   try {
-    ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+    ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
   } catch (e) {
     /* image not ready yet */
   }
 
   // frame counter overlay
   ctx.fillStyle = "rgba(0,0,0,0.55)";
-  ctx.fillRect(x, y + h - 16, w, 16);
+  ctx.fillRect(0, h - 16, w, 16);
   ctx.fillStyle = "#fff";
   ctx.font = "11px monospace";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   const name = p.frames[p.index]?.name || "";
-  ctx.fillText(`${p.index + 1}/${p.images.length}  ${name}`, x + 5, y + h - 8);
-
-  ctx.restore();
+  ctx.fillText(`${p.index + 1}/${p.images.length}  ${name}`, 5, h - 8);
 }
 
 function toast(node, message) {

@@ -55,7 +55,8 @@ def test_selector_then_pack_roundtrip(tmp_path):
     atlas, saved_path = out["result"]
 
     # max right = 16 + 12 = 28 -> 32 ; max top = max(20, 16) -> 32
-    assert atlas.shape == (1, 32, 32, 3)
+    # RGBA: the atlas output keeps its alpha channel so transparency survives.
+    assert atlas.shape == (1, 32, 32, 4)
     assert saved_path == ""
 
 
