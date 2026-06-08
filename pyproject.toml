@@ -7,6 +7,9 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 keywords = ["comfyui", "hollow-knight", "customknight", "sprite", "atlas", "modding"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+]
 
 # Runtime dependencies that ComfyUI does NOT already provide.
 # (torch, numpy and the aiohttp server ship with ComfyUI, so they are not

@@ -127,4 +127,26 @@ comfyui-customknight-creator/
 
 ## License
 
-MIT. CustomKnight and Hollow Knight are property of their respective owners.
+This project is licensed under the **GNU General Public License v3.0**
+(see [`LICENSE`](LICENSE)).
+
+It is a derivative work — a node port — of
+[CustomKnight-Creator](https://github.com/cmot17/CustomKnight-Creator) by
+cmot17, which is itself licensed under the GPLv3. Because the GPL is a copyleft
+license, this port inherits the same terms and cannot be relicensed under a
+more permissive license such as MIT.
+
+```
+Copyright (C) 2026 ComfyUI CustomKnight Creator contributors
+Copyright (C) cmot17 and the CustomKnight-Creator contributors (original work)
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, version 3.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+```
+
+CustomKnight and Hollow Knight are property of their respective owners.
