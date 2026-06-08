@@ -17,6 +17,9 @@ classifiers = [
 dependencies = [
     "pillow>=9.0",
     "numpy>=1.23",
+    # ffmpeg binary for CK Video Combine's video containers (mp4/webm/...).
+    # A system ffmpeg works too; gif/webp output needs neither.
+    "imageio-ffmpeg>=0.4",
 ]
 
 [project.urls]

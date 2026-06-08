@@ -1,4 +1,7 @@
 # Runtime dependencies not already shipped with ComfyUI.
-# (torch / numpy / aiohttp come with ComfyUI.)
+# (torch / numpy / aiohttp / av come with ComfyUI.)
 pillow>=9.0
 numpy>=1.23
+# Bundles an ffmpeg binary used by CK Video Combine for video containers
+# (mp4/webm/...). A system ffmpeg on PATH works too; gif/webp need neither.
+imageio-ffmpeg>=0.4

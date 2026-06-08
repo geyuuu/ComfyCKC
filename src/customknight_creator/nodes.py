@@ -483,3 +483,17 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CKMergeEdits": "CK Merge Edits",
     "CKLoadProjectInfo": "CK Project Info",
 }
+
+# CK Video Combine depends on ComfyUI's native VIDEO type (comfy_api). Register it
+# only when that's available so the rest of the nodes still load on older hosts.
+try:
+    import comfy_api.input_impl  # noqa: F401
+
+    from .video_combine import CKVideoCombine
+
+    NODE_CLASS_MAPPINGS["CKVideoCombine"] = CKVideoCombine
+    NODE_DISPLAY_NAME_MAPPINGS["CKVideoCombine"] = "CK Video Combine"
+except Exception as exc:  # pragma: no cover - host without the VIDEO type
+    import warnings
+
+    warnings.warn(f"CK Video Combine not loaded ({exc}).", stacklevel=2)
