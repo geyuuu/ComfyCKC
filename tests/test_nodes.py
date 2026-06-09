@@ -68,3 +68,87 @@ def test_pack_frame_count_mismatch(tmp_path):
     packer = nodes.CKPackAtlas()
     with pytest.raises(ValueError, match="Frame count mismatch"):
         packer.pack(ck_frames, images[:1], save_to_output=False)
+
+
+def _make_numbered_dump(tmp_path):
+    """Numbered animation folders split across two atlases (collections)."""
+    base = tmp_path / "Skin"
+    root = base / "Hornet"
+    atlases = root / "0.Atlases"
+    atlases.mkdir(parents=True)
+    run = root / "001.Run"
+    idle = root / "002.Idle"
+    run.mkdir()
+    idle.mkdir()
+    Image.new("RGBA", (10, 20), (255, 0, 0, 255)).save(run / "001-00-000.png")
+    Image.new("RGBA", (12, 16), (0, 255, 0, 255)).save(run / "001-01-001.png")
+    Image.new("RGBA", (8, 8), (0, 0, 255, 255)).save(idle / "002-00-002.png")
+    info = {
+        "sid": ["r0", "r1", "i0"],
+        "sx": [0, 0, 16],
+        "sy": [0, 0, 0],
+        "sxr": [0, 0, 0],
+        "syr": [0, 0, 0],
+        "swidth": [10, 12, 8],
+        "sheight": [20, 16, 8],
+        "sfilpped": [False, False, False],
+        "spath": [
+            "Hornet/001.Run/001-00-000.png",
+            "Hornet/001.Run/001-01-001.png",
+            "Hornet/002.Idle/002-00-002.png",
+        ],
+        "scollectionname": ["atlas0", "atlas1", "atlas0"],
+    }
+    (atlases / "SpriteInfo.json").write_text(json.dumps(info), encoding="utf-8")
+    return str(root)
+
+
+def test_selector_range_mode_concatenates_across_collections(tmp_path):
+    root = _make_numbered_dump(tmp_path)
+    selector = nodes.CKAnimationSelector()
+    images, alpha, ck_frames = selector.select(
+        root, "", "", mode="animation range", animation_range="1-2"
+    )
+
+    # Three frames padded to the largest (12 x 20).
+    assert images.shape == (3, 20, 12, 3)
+    assert alpha.shape == (3, 20, 12)
+    assert ck_frames["mode"] == "animation range"
+    assert ck_frames["collection"] is None
+    assert ck_frames["collections"] == ["atlas0", "atlas1"]
+    assert len(ck_frames["sprites"]) == 3
+
+
+def test_selector_range_mode_requires_a_range(tmp_path):
+    root = _make_numbered_dump(tmp_path)
+    selector = nodes.CKAnimationSelector()
+    with pytest.raises(ValueError, match="enter a range"):
+        selector.select(root, "", "", mode="animation range", animation_range="")
+
+
+def test_pack_range_writes_one_atlas_per_collection(tmp_path):
+    root = _make_numbered_dump(tmp_path)
+    selector = nodes.CKAnimationSelector()
+    images, alpha, ck_frames = selector.select(
+        root, "", "", mode="animation range", animation_range="1-2"
+    )
+
+    ext_dir = tmp_path / "skin"
+    packer = nodes.CKPackAtlas()
+    out = packer.pack(
+        ck_frames,
+        images,
+        edited_alpha=alpha,
+        save_to_output=False,
+        external_directory=str(ext_dir),
+    )
+    atlas, saved_path = out["result"]
+
+    # Two collections -> a 2-image batch, padded to the larger atlas (atlas0 is
+    # 32x32: right 16+8=24 -> 32, top 20 -> 32; atlas1 is 16x16).
+    assert atlas.shape == (2, 32, 32, 4)
+    # One <collection>.png written to the external skin folder for each.
+    assert (ext_dir / "atlas0.png").is_file()
+    assert (ext_dir / "atlas1.png").is_file()
+    assert str(ext_dir / "atlas0.png") in saved_path
+    assert str(ext_dir / "atlas1.png") in saved_path

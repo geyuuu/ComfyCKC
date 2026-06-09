@@ -33,6 +33,7 @@ from .sprite_handler import (
     SpriteProject,
     atlas_size_for,
     pack_collection,
+    parse_index_range,
 )
 
 try:  # ComfyUI runtime - always present in a real install.
@@ -159,7 +160,28 @@ class CKAnimationSelector:
                 ),
                 "animation": (
                     [_COMBO_PLACEHOLDER],
-                    {"tooltip": "Animation folder whose frames are output."},
+                    {"tooltip": "Animation folder whose frames are output "
+                    "(single-animation mode)."},
+                ),
+                "mode": (
+                    ["single animation", "animation range"],
+                    {
+                        "default": "single animation",
+                        "tooltip": "'single animation' outputs the collection + "
+                        "animation chosen above. 'animation range' ignores them "
+                        "and concatenates every animation whose folder-name "
+                        "number falls in 'animation_range'.",
+                    },
+                ),
+                "animation_range": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Animation-range mode only. Numbers taken from "
+                        "the animation folder names (e.g. '034.Idle' -> 34). "
+                        "Examples: '1-10', '34', '1-3,5,7-9'. Ranges are "
+                        "inclusive; frames are concatenated in animation order.",
+                    },
                 ),
             },
         }
@@ -171,7 +193,9 @@ class CKAnimationSelector:
     DESCRIPTION = (
         "Pick a collection and animation from CustomKnight Root Folders and "
         "output the frames as a PNG image sequence (plus alpha + a CK_FRAMES "
-        "descriptor for repacking)."
+        "descriptor for repacking). Switch 'mode' to 'animation range' to "
+        "concatenate every animation in a number range (e.g. '1-10') into one "
+        "sequence - the frames may span several collections and still repack."
     )
 
     # Combos are populated dynamically on the client, so skip the built-in
@@ -180,19 +204,51 @@ class CKAnimationSelector:
     def VALIDATE_INPUTS(cls, **kwargs):
         return True
 
-    def select(self, root_folders: str, collection: str, animation: str):
-        if collection in ("", _COMBO_PLACEHOLDER):
-            raise ValueError("Select a collection (click 'Refresh', then choose one).")
-        if animation in ("", _COMBO_PLACEHOLDER):
-            raise ValueError("Select an animation.")
-
+    def select(
+        self,
+        root_folders: str,
+        collection: str,
+        animation: str,
+        mode: str = "single animation",
+        animation_range: str = "",
+    ):
         project = _project_from(root_folders)
-        sprites = project.sprites_in_animation(animation, collection)
-        if not sprites:
-            raise ValueError(
-                f'No frames found for animation "{animation}" in collection '
-                f'"{collection}".'
-            )
+
+        if mode == "animation range":
+            numbers = parse_index_range(animation_range)
+            if not numbers:
+                raise ValueError(
+                    "Animation-range mode: enter a range like “1-10” "
+                    "(numbers come from the animation folder names)."
+                )
+            sprites = project.sprites_in_animation_range(numbers)
+            if not sprites:
+                raise ValueError(
+                    "No animations matched folder-name numbers in "
+                    f"“{animation_range.strip()}”."
+                )
+            animation_label = f"range:{animation_range.strip()}"
+            collection_value = None
+            collections_present: list[str] = []
+            for s in sprites:
+                if s.collection not in collections_present:
+                    collections_present.append(s.collection)
+        else:
+            if collection in ("", _COMBO_PLACEHOLDER):
+                raise ValueError(
+                    "Select a collection (click 'Refresh', then choose one)."
+                )
+            if animation in ("", _COMBO_PLACEHOLDER):
+                raise ValueError("Select an animation.")
+            sprites = project.sprites_in_animation(animation, collection)
+            if not sprites:
+                raise ValueError(
+                    f'No frames found for animation "{animation}" in collection '
+                    f'"{collection}".'
+                )
+            animation_label = animation
+            collection_value = collection
+            collections_present = [collection]
 
         frames = [project.crop_content(s) for s in sprites]
         images, masks, max_w, max_h = stack_frames(frames)
@@ -200,8 +256,10 @@ class CKAnimationSelector:
         ck_frames = {
             "root_folders": root_folders,
             "basepath": project.basepath,
-            "collection": collection,
-            "animation": animation,
+            "mode": mode,
+            "collection": collection_value,
+            "collections": collections_present,
+            "animation": animation_label,
             "frame_size": [max_w, max_h],
             "sprites": [s.to_dict() for s in sprites],
         }
@@ -329,7 +387,9 @@ class CKPackAtlas:
     CATEGORY = CATEGORY
     DESCRIPTION = (
         "Drop the edited frames onto every unchanged sprite of the collection "
-        "and pack them into one atlas PNG, ready for CustomKnight."
+        "and pack them into one atlas PNG, ready for CustomKnight. When the "
+        "frames span several collections (CK Animation Selector's 'animation "
+        "range' mode), one atlas PNG is written per collection."
     )
 
     def pack(
@@ -344,7 +404,6 @@ class CKPackAtlas:
         override_height=0,
     ):
         project = SpriteProject.from_root_folders(ck_frames["root_folders"])
-        collection = ck_frames["collection"]
         sprites = [Sprite.from_dict(d) for d in ck_frames["sprites"]]
 
         if edited_frames.shape[0] != len(sprites):
@@ -354,52 +413,86 @@ class CKPackAtlas:
                 "Did an upstream node add/drop frames?"
             )
 
-        # Build replacements: each edited frame -> upright (w, h) RGBA content.
-        replacements: dict[str, Image.Image] = {}
-        fallback = {s.path: s for s in project.sprites_in_collection(collection)}
+        # Group the edited frames by their collection, preserving first-seen
+        # order. Single-animation edits have exactly one collection; an
+        # "animation range" selection may carry several, each packed into its
+        # own atlas PNG below.
+        groups: dict[str, list[int]] = {}
         for i, sprite in enumerate(sprites):
-            mask = edited_alpha[i] if edited_alpha is not None else None
-            content = tensor_to_pil_rgba(edited_frames[i], mask)
-            content = content.crop((0, 0, sprite.w, sprite.h))
-            # If the edit dropped alpha, keep the original sprite's transparency.
-            if edited_alpha is None and edited_frames.shape[-1] < 4 and sprite.path in fallback:
-                orig = project.crop_content(fallback[sprite.path])
-                content.putalpha(orig.getchannel("A"))
-            replacements[sprite.path] = content
+            groups.setdefault(sprite.collection, []).append(i)
 
+        # An explicit override only makes sense for a single atlas; with several
+        # collections each keeps its own natural (power-of-two) size.
         size = None
-        if override_width > 0 and override_height > 0:
+        if override_width > 0 and override_height > 0 and len(groups) == 1:
             size = (override_width, override_height)
 
-        result = pack_collection(project, collection, replacements, size)
-        # Keep alpha: the atlas is transparent, and the output IMAGE must match
-        # the saved PNG shown in the node's thumbnail.
-        atlas_tensor = pil_rgba_to_tensor(result.image)
-
-        # Always produce a thumbnail for the node. When saving to output we
-        # persist it there; otherwise we write a throwaway copy to ComfyUI's
-        # temp folder purely so the in-node preview shows up regardless of the
-        # save_to_output toggle.
-        saved_path = ""
-        ui = {}
-        if save_to_output:
-            saved_path, ui = self._save_image(
-                result.image, f"{filename_prefix}_{collection}", "output"
-            )
-        else:
-            _, ui = self._save_image(
-                result.image, self._temp_prefix(collection), "temp"
-            )
-
-        if external_directory.strip():
-            ext_dir = external_directory.strip().strip('"')
+        ext_dir = external_directory.strip().strip('"')
+        if ext_dir:
             os.makedirs(ext_dir, exist_ok=True)
-            ext_path = os.path.join(ext_dir, f"{collection}.png")
-            result.image.save(ext_path)
-            if not saved_path:
-                saved_path = ext_path
 
-        return {"ui": ui, "result": (atlas_tensor, saved_path)}
+        fallback = {s.path: s for s in project.sprites}
+
+        atlas_tensors: list[torch.Tensor] = []
+        saved_paths: list[str] = []
+        ui_images: list[dict] = []
+
+        for collection, indices in groups.items():
+            # Build replacements: each edited frame -> upright (w, h) RGBA content.
+            replacements: dict[str, Image.Image] = {}
+            for i in indices:
+                sprite = sprites[i]
+                mask = edited_alpha[i] if edited_alpha is not None else None
+                content = tensor_to_pil_rgba(edited_frames[i], mask)
+                content = content.crop((0, 0, sprite.w, sprite.h))
+                # If the edit dropped alpha, keep the original sprite's transparency.
+                if (
+                    edited_alpha is None
+                    and edited_frames.shape[-1] < 4
+                    and sprite.path in fallback
+                ):
+                    orig = project.crop_content(fallback[sprite.path])
+                    content.putalpha(orig.getchannel("A"))
+                replacements[sprite.path] = content
+
+            result = pack_collection(project, collection, replacements, size)
+            # Keep alpha: the atlas is transparent, and the output IMAGE must
+            # match the saved PNG shown in the node's thumbnail.
+            atlas_tensors.append(pil_rgba_to_tensor(result.image))
+
+            # Always produce a thumbnail for the node. When saving to output we
+            # persist it there; otherwise we write a throwaway copy to ComfyUI's
+            # temp folder purely so the in-node preview shows up regardless of
+            # the save_to_output toggle.
+            if save_to_output:
+                out_path, ui = self._save_image(
+                    result.image, f"{filename_prefix}_{collection}", "output"
+                )
+            else:
+                out_path, ui = self._save_image(
+                    result.image, self._temp_prefix(collection), "temp"
+                )
+            ui_images.extend(ui.get("images", []))
+
+            ext_path = ""
+            if ext_dir:
+                ext_path = os.path.join(ext_dir, f"{collection}.png")
+                result.image.save(ext_path)
+
+            chosen = out_path or ext_path
+            if chosen:
+                saved_paths.append(chosen)
+
+        # Stack the per-collection atlases into one IMAGE batch (transparent-
+        # padded to a common size) so a single output wire previews them all.
+        batch_w = max(t.shape[2] for t in atlas_tensors)
+        batch_h = max(t.shape[1] for t in atlas_tensors)
+        atlas_batch = torch.cat(
+            [_pad_batch(t, batch_w, batch_h, 0.0) for t in atlas_tensors], 0
+        )
+        saved_path = "\n".join(saved_paths)
+
+        return {"ui": {"images": ui_images}, "result": (atlas_batch, saved_path)}
 
     @staticmethod
     def _temp_prefix(collection: str) -> str:

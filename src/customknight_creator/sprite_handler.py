@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -115,6 +116,54 @@ def parse_root_folders(text: str | Iterable[str]) -> list[str]:
         if folder and folder not in folders:
             folders.append(os.path.normpath(folder))
     return folders
+
+
+def animation_number(name: str) -> int | None:
+    """The leading sequence number embedded in an animation folder name.
+
+    CustomKnight / Silksong dumps commonly prefix each animation folder with a
+    zero-padded index, e.g. ``"034.Idle"`` -> ``34`` or ``"001.AirDash Burst"``
+    -> ``1``. Returns ``None`` when the name has no leading digits (such
+    animations are simply never matched by a range).
+    """
+    match = re.match(r"\s*(\d+)", name)
+    return int(match.group(1)) if match else None
+
+
+def parse_index_range(text: str) -> list[int]:
+    """Parse a range expression into a sorted list of unique integers.
+
+    Accepts terms separated by commas and/or whitespace; ``-`` denotes an
+    inclusive range. Examples::
+
+        "1-10"      -> [1, 2, ..., 10]
+        "34"        -> [34]
+        "1-3,5,7-9" -> [1, 2, 3, 5, 7, 8, 9]
+
+    An empty / blank string yields ``[]``. Raises ``ValueError`` on a malformed
+    term or a reversed range (``"10-1"``).
+    """
+    result: set[int] = set()
+    for term in re.split(r"[,\s]+", text.strip()):
+        if not term:
+            continue
+        if "-" in term:
+            lo_str, _, hi_str = term.partition("-")
+            try:
+                lo, hi = int(lo_str), int(hi_str)
+            except ValueError:
+                raise ValueError(
+                    f'Invalid range term "{term}" (expected e.g. "1-10").'
+                ) from None
+            if lo > hi:
+                raise ValueError(f'Range "{term}" is reversed (start > end).')
+            result.update(range(lo, hi + 1))
+        else:
+            try:
+                result.add(int(term))
+            except ValueError:
+                raise ValueError(f'Invalid number "{term}".') from None
+    return sorted(result)
 
 
 def _next_power_of_two(n: int) -> int:
@@ -229,6 +278,26 @@ class SpriteProject:
             for sprite in self._filtered(collection)
             if sprite.animation == animation
         ]
+
+    def sprites_in_animation_range(self, numbers: Iterable[int]) -> list[Sprite]:
+        """All sprites whose animation folder number is in ``numbers``.
+
+        Frames are ordered by animation number (ascending), then by their
+        original SpriteInfo order within each animation, so several animations
+        concatenate into one continuous sequence. The result may span multiple
+        collections (a single animation folder can be packed into more than one
+        atlas); each ``Sprite`` keeps its own ``collection`` for repacking.
+        """
+        wanted = set(numbers)
+        if not wanted:
+            return []
+        ordered: list[tuple[int, int, Sprite]] = []
+        for index, sprite in enumerate(self.sprites):
+            num = animation_number(sprite.animation)
+            if num is not None and num in wanted:
+                ordered.append((num, index, sprite))
+        ordered.sort(key=lambda item: (item[0], item[1]))
+        return [sprite for _, _, sprite in ordered]
 
     def sprites_in_collection(self, collection: str) -> list[Sprite]:
         return [s for s in self.sprites if s.collection == collection]

@@ -29,6 +29,24 @@ each containing `0.Atlases/SpriteInfo.json`). Just like the original tool you:
 Dropdowns cascade automatically as you type/change Root Folders → collection →
 animation (served from disk by the bundled HTTP routes).
 
+**Animation-range mode.** Set `mode` to **`animation range`** and the node
+ignores the collection/animation dropdowns and instead concatenates *every*
+animation whose folder-name number falls in `animation_range` into one
+sequence. The number is the prefix CustomKnight / Silksong dumps put on each
+animation folder (e.g. `034.Idle` → `34`). Accepts inclusive ranges and lists:
+
+```
+1-10        animations 001..010
+34          just animation 034
+1-3,5,7-9   mix ranges and singles
+```
+
+Frames are emitted in animation order (then SpriteInfo order within each), and
+the live preview plays the whole concatenated clip. Because one numbered
+animation can be packed into more than one atlas, a range commonly spans
+**several collections** — that's fine, the frames carry their own collection
+and **CK Pack Atlas** rebuilds one atlas per collection (see below).
+
 **Outputs**
 
 | Output | Type | Description |
@@ -54,10 +72,18 @@ crop / 90° rotation / flip and power-of-two sizing as the original packer.
   temp folder for preview only (off).
 - Optional `external_directory` also writes `<collection>.png` straight into
   your CustomKnight skin folder.
-- `override_width` / `override_height` force exact atlas dimensions if needed.
+- `override_width` / `override_height` force exact atlas dimensions if needed
+  (single-collection only; ignored when the input spans several collections).
 
 If you don't feed an `alpha`/`MASK` back in, the original sprite's transparency
 is preserved automatically.
+
+When the input frames span **multiple collections** (from the selector's
+`animation range` mode, possibly via **CK Merge Edits**), the node groups the
+frames by collection and writes **one atlas PNG per collection** — saved as
+`<prefix>_<collection>.png` in `output/` and/or `<collection>.png` in
+`external_directory`. The `atlas` output then carries all of them as one image
+batch, and `saved_path` lists every written path (newline-separated).
 
 ### CK Merge Edits
 Combine two edited animations from the **same** collection into one

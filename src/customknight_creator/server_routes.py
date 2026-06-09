@@ -15,7 +15,7 @@ import os
 
 from aiohttp import web
 
-from .sprite_handler import SpriteProject, parse_root_folders
+from .sprite_handler import SpriteProject, parse_index_range, parse_root_folders
 
 try:
     from server import PromptServer
@@ -73,6 +73,31 @@ def register_routes() -> None:
             {
                 "frames": [
                     {"path": s.path, "name": s.filename, "w": s.w, "h": s.h}
+                    for s in sprites
+                ]
+            }
+        )
+
+    @routes.get("/customknight/range_frames")
+    async def range_frames(request: web.Request):
+        root_folders = request.query.get("root_folders", "")
+        range_text = request.query.get("range", "")
+        try:
+            project = _load_project(root_folders)
+            numbers = parse_index_range(range_text)
+            sprites = project.sprites_in_animation_range(numbers)
+        except Exception as exc:  # noqa: BLE001
+            return _err(str(exc))
+        return web.json_response(
+            {
+                "frames": [
+                    {
+                        "path": s.path,
+                        "name": s.filename,
+                        "w": s.w,
+                        "h": s.h,
+                        "collection": s.collection,
+                    }
                     for s in sprites
                 ]
             }

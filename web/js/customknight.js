@@ -148,6 +148,9 @@ function setupSelectorNode(node) {
   // --- wire change handlers ------------------------------------------------
   hookWidget(collectionWidget, () => reloadAnimations(node));
   hookWidget(animationWidget, () => reloadFrames(node));
+  // Switching mode or editing the range re-loads the preview.
+  hookWidget(findWidget(node, "mode"), () => reloadFrames(node));
+  hookWidget(findWidget(node, "animation_range"), () => reloadFrames(node));
 
   startPreviewLoop(node);
 
@@ -162,6 +165,12 @@ function setupSelectorNode(node) {
       el._ckHooked = true;
       el.addEventListener("change", () => reloadCollections(node));
       el.addEventListener("blur", () => reloadCollections(node));
+    }
+    const rangeEl = findWidget(node, "animation_range")?.inputEl;
+    if (rangeEl && !rangeEl._ckHooked) {
+      rangeEl._ckHooked = true;
+      rangeEl.addEventListener("change", () => reloadFrames(node));
+      rangeEl.addEventListener("blur", () => reloadFrames(node));
     }
     const size = node.computeSize();
     node.setSize([Math.max(node.size[0], size[0]), size[1]]);
@@ -309,6 +318,28 @@ async function reloadAnimations(node) {
 
 async function reloadFrames(node) {
   const root = findWidget(node, "root_folders")?.value || "";
+  const mode = findWidget(node, "mode")?.value || "single animation";
+
+  // "animation range" mode: preview the concatenated frames of every animation
+  // whose folder-name number is in the range, regardless of collection.
+  if (mode === "animation range") {
+    const range = findWidget(node, "animation_range")?.value || "";
+    if (!root.trim() || !range.trim()) {
+      setFrames(node, [], root);
+      return;
+    }
+    try {
+      const { frames } = await getJSON("/customknight/range_frames", {
+        root_folders: root,
+        range,
+      });
+      setFrames(node, frames, root);
+    } catch (e) {
+      toast(node, `Frames: ${e.message}`);
+    }
+    return;
+  }
+
   const collection = findWidget(node, "collection")?.value || "";
   const animation = findWidget(node, "animation")?.value || "";
   if (!animation || animation === PLACEHOLDER) return;
@@ -318,23 +349,28 @@ async function reloadFrames(node) {
       collection,
       animation,
     });
-    const p = node._ckPreview;
-    p.frames = frames;
-    p.index = 0;
-    p.images = frames.map((f) => {
-      const img = new Image();
-      img.onload = () => renderPreview(node);
-      img.src = imageURL(root, f.path);
-      return img;
-    });
-    if (node._ckFrameWidget) {
-      node._ckFrameWidget.options.max = Math.max(0, frames.length - 1);
-      node._ckFrameWidget.value = 0;
-    }
-    renderPreview(node);
+    setFrames(node, frames, root);
   } catch (e) {
     toast(node, `Frames: ${e.message}`);
   }
+}
+
+/** Load `frames` (path/name/w/h list) into the preview and reset the scrubber. */
+function setFrames(node, frames, root) {
+  const p = node._ckPreview;
+  p.frames = frames || [];
+  p.index = 0;
+  p.images = p.frames.map((f) => {
+    const img = new Image();
+    img.onload = () => renderPreview(node);
+    img.src = imageURL(root, f.path);
+    return img;
+  });
+  if (node._ckFrameWidget) {
+    node._ckFrameWidget.options.max = Math.max(0, p.frames.length - 1);
+    node._ckFrameWidget.value = 0;
+  }
+  renderPreview(node);
 }
 
 function startPreviewLoop(node) {
