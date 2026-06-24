@@ -51,8 +51,7 @@ and **CK Pack Atlas** rebuilds one atlas per collection (see below).
 
 | Output | Type | Description |
 | --- | --- | --- |
-| `frames` | `IMAGE` | The animation's frames as a PNG image sequence (batch). |
-| `alpha` | `MASK` | The frames' alpha channels (sprites are transparent). |
+| `frames` | `IMAGE` | The animation's RGBA frames as a PNG image sequence (batch); alpha is the fourth channel. |
 | `ck_frames` | `CK_FRAMES` | Layout descriptor used by the packer. |
 
 Frames of different sizes are padded (top-left anchored, transparent) to a
@@ -90,8 +89,9 @@ crop / 90° rotation / flip and power-of-two sizing as the original packer.
 - `override_width` / `override_height` force exact atlas dimensions if needed
   (single-collection only; ignored when the input spans several collections).
 
-If you don't feed an `alpha`/`MASK` back in, the original sprite's transparency
-is preserved automatically.
+Transparency is carried in the fourth channel of `frames`. If an image operation
+drops that channel and sends RGB frames to the packer, the original sprite's
+transparency is restored automatically.
 
 When the input frames span **multiple collections** (from the selector's
 `animation range` mode, possibly via **CK Merge Edits**), the node groups the
@@ -102,8 +102,9 @@ batch, and `saved_path` lists every written path (newline-separated).
 
 ### CK Merge Edits
 Combine two edited animations from the **same** collection into one
-`frames` + `ck_frames` pair so they pack into a single atlas. Chain several of
-these to edit many animations at once.
+`frames` + `ck_frames` pair so they pack into a single atlas. RGBA transparency
+stays inside `frames`; there are no separate alpha inputs or output. Chain
+several of these to edit many animations at once.
 
 ### CK Project Info
 Inspect a dump: prints the base path, every collection (with computed atlas

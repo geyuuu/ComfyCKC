@@ -5,7 +5,7 @@ Two core nodes mirror the original desktop tool:
 ``CKAnimationSelector``
     Input is one or more *Root Folders*. Pick a collection (atlas) and an
     animation - exactly like the original - and the node outputs that
-    animation's frames as a PNG image sequence (an ``IMAGE`` batch) plus a
+    animation's RGBA frames as a PNG image sequence (an ``IMAGE`` batch) plus a
     ``CK_FRAMES`` descriptor used for repacking. A live animated preview is
     rendered on the node by the bundled web extension.
 
@@ -50,12 +50,6 @@ _COMBO_PLACEHOLDER = "<refresh>"
 # ---------------------------------------------------------------------------
 # Tensor <-> PIL helpers
 # ---------------------------------------------------------------------------
-def pil_to_tensor(img: Image.Image) -> torch.Tensor:
-    """RGB ``[1, H, W, 3]`` float tensor in ``[0, 1]``."""
-    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-    return torch.from_numpy(arr)[None, ...]
-
-
 def pil_rgba_to_tensor(img: Image.Image) -> torch.Tensor:
     """RGBA ``[1, H, W, 4]`` float tensor in ``[0, 1]``.
 
@@ -68,35 +62,18 @@ def pil_rgba_to_tensor(img: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr)[None, ...]
 
 
-def pil_alpha_to_mask(img: Image.Image) -> torch.Tensor:
-    """Alpha channel as a ``[1, H, W]`` mask (1 = opaque)."""
-    if "A" in img.getbands():
-        alpha = np.asarray(img.getchannel("A"), dtype=np.float32) / 255.0
-    else:
-        alpha = np.ones((img.size[1], img.size[0]), dtype=np.float32)
-    return torch.from_numpy(alpha)[None, ...]
-
-
-def tensor_to_pil_rgba(image: torch.Tensor, mask: torch.Tensor | None = None) -> Image.Image:
+def tensor_to_pil_rgba(image: torch.Tensor) -> Image.Image:
     """Convert one frame (``[H, W, C]`` or ``[1, H, W, C]``) to an RGBA PIL image.
 
-    The optional ``mask`` supplies the alpha channel; otherwise the image's own
-    4th channel is used, falling back to fully opaque.
+    The image's fourth channel supplies alpha, falling back to fully opaque for
+    an RGB input.
     """
     if image.dim() == 4:
         image = image[0]
     rgb = (image[..., :3].clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
     h, w = rgb.shape[:2]
 
-    if mask is not None:
-        if mask.dim() == 3:
-            mask = mask[0]
-        alpha = (mask.clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
-        if alpha.shape != (h, w):
-            alpha = np.asarray(
-                Image.fromarray(alpha).resize((w, h), Image.NEAREST), dtype=np.uint8
-            )
-    elif image.shape[-1] >= 4:
+    if image.shape[-1] >= 4:
         alpha = (image[..., 3].clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
     else:
         alpha = np.full((h, w), 255, dtype=np.uint8)
@@ -105,25 +82,23 @@ def tensor_to_pil_rgba(image: torch.Tensor, mask: torch.Tensor | None = None) ->
     return Image.fromarray(rgba, "RGBA")
 
 
-def stack_frames(frames: list[Image.Image]) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+def stack_frames(frames: list[Image.Image]) -> tuple[torch.Tensor, int, int]:
     """Pad ``(w, h)`` RGBA frames to a common size and stack into batches.
 
     Frames are anchored top-left on a transparent canvas sized to the largest
-    frame, so a single ``IMAGE`` / ``MASK`` batch can carry differently sized
-    sprites. Returns ``(images, masks, max_w, max_h)``.
+    frame, so a single RGBA ``IMAGE`` batch can carry differently sized
+    sprites. Returns ``(images, max_w, max_h)``.
     """
     max_w = max((f.size[0] for f in frames), default=1)
     max_h = max((f.size[1] for f in frames), default=1)
 
     imgs: list[torch.Tensor] = []
-    masks: list[torch.Tensor] = []
     for frame in frames:
         canvas = Image.new("RGBA", (max_w, max_h), (0, 0, 0, 0))
         canvas.paste(frame, (0, 0))
-        imgs.append(pil_to_tensor(canvas))
-        masks.append(pil_alpha_to_mask(canvas))
+        imgs.append(pil_rgba_to_tensor(canvas))
 
-    return torch.cat(imgs, 0), torch.cat(masks, 0), max_w, max_h
+    return torch.cat(imgs, 0), max_w, max_h
 
 
 def _project_from(root_folders: str) -> SpriteProject:
@@ -187,13 +162,13 @@ class CKAnimationSelector:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "CK_FRAMES")
-    RETURN_NAMES = ("frames", "alpha", "ck_frames")
+    RETURN_TYPES = ("IMAGE", "CK_FRAMES")
+    RETURN_NAMES = ("frames", "ck_frames")
     FUNCTION = "select"
     CATEGORY = CATEGORY
     DESCRIPTION = (
         "Pick a collection and animation from CustomKnight Root Folders and "
-        "output the frames as a PNG image sequence (plus alpha + a CK_FRAMES "
+        "output the frames as an RGBA PNG image sequence (plus a CK_FRAMES "
         "descriptor for repacking). Switch 'mode' to 'animation range' to "
         "concatenate every animation in a number range (e.g. '1-10') into one "
         "sequence - the frames may span several collections and still repack."
@@ -252,7 +227,7 @@ class CKAnimationSelector:
             collections_present = [collection]
 
         frames = [project.crop_content(s) for s in sprites]
-        images, masks, max_w, max_h = stack_frames(frames)
+        images, max_w, max_h = stack_frames(frames)
 
         ck_frames = {
             "root_folders": root_folders,
@@ -264,7 +239,7 @@ class CKAnimationSelector:
             "frame_size": [max_w, max_h],
             "sprites": [s.to_dict() for s in sprites],
         }
-        return (images, masks, ck_frames)
+        return (images, ck_frames)
 
 
 # ---------------------------------------------------------------------------
@@ -421,14 +396,10 @@ class CKMergeEdits:
                 "ck_frames_b": ("CK_FRAMES",),
                 "images_b": ("IMAGE",),
             },
-            "optional": {
-                "alpha_a": ("MASK",),
-                "alpha_b": ("MASK",),
-            },
         }
 
-    RETURN_TYPES = ("CK_FRAMES", "IMAGE", "MASK")
-    RETURN_NAMES = ("ck_frames", "frames", "alpha")
+    RETURN_TYPES = ("CK_FRAMES", "IMAGE")
+    RETURN_NAMES = ("ck_frames", "frames")
     FUNCTION = "merge"
     CATEGORY = CATEGORY
     DESCRIPTION = (
@@ -436,7 +407,7 @@ class CKMergeEdits:
         "packed together. Chain multiple of these for more animations."
     )
 
-    def merge(self, ck_frames_a, images_a, ck_frames_b, images_b, alpha_a=None, alpha_b=None):
+    def merge(self, ck_frames_a, images_a, ck_frames_b, images_b):
         if ck_frames_a["collection"] != ck_frames_b["collection"]:
             raise ValueError(
                 "Cannot merge edits from different collections: "
@@ -451,42 +422,19 @@ class CKMergeEdits:
         images = _pad_batch(images_a, max_w, max_h, 0.0)
         images = torch.cat([images, _pad_batch(images_b, max_w, max_h, 0.0)], 0)
 
-        masks = torch.cat(
-            [
-                _pad_mask(_mask_for(alpha_a, images_a), max_w, max_h),
-                _pad_mask(_mask_for(alpha_b, images_b), max_w, max_h),
-            ],
-            0,
-        )
-
         merged = dict(ck_frames_a)
         merged["frame_size"] = [max_w, max_h]
         merged["animation"] = f'{ck_frames_a.get("animation", "")}+{ck_frames_b.get("animation", "")}'
         merged["sprites"] = list(ck_frames_a["sprites"]) + list(ck_frames_b["sprites"])
-        return (merged, images, masks)
-
-
-def _mask_for(mask, images):
-    if mask is not None:
-        return mask
-    return torch.ones((images.shape[0], images.shape[1], images.shape[2]), dtype=torch.float32)
+        return (merged, images)
 
 
 def _pad_batch(batch: torch.Tensor, w: int, h: int, fill: float) -> torch.Tensor:
     b, ih, iw, c = batch.shape
     if ih == h and iw == w:
         return batch
-    out = torch.full((b, h, w, c), fill, dtype=batch.dtype)
+    out = batch.new_full((b, h, w, c), fill)
     out[:, :ih, :iw, :] = batch
-    return out
-
-
-def _pad_mask(mask: torch.Tensor, w: int, h: int) -> torch.Tensor:
-    b, ih, iw = mask.shape
-    if ih == h and iw == w:
-        return mask
-    out = torch.zeros((b, h, w), dtype=mask.dtype)
-    out[:, :ih, :iw] = mask
     return out
 
 
@@ -504,7 +452,6 @@ class CKPackAtlas:
                 "edited_frames": ("IMAGE",),
             },
             "optional": {
-                "edited_alpha": ("MASK",),
                 "save_to_output": ("BOOLEAN", {"default": True}),
                 "filename_prefix": ("STRING", {"default": "CustomKnight/atlas"}),
                 "external_directory": (
@@ -536,7 +483,6 @@ class CKPackAtlas:
         self,
         ck_frames,
         edited_frames,
-        edited_alpha=None,
         save_to_output=True,
         filename_prefix="CustomKnight/atlas",
         external_directory="",
@@ -582,13 +528,11 @@ class CKPackAtlas:
             replacements: dict[str, Image.Image] = {}
             for i in indices:
                 sprite = sprites[i]
-                mask = edited_alpha[i] if edited_alpha is not None else None
-                content = tensor_to_pil_rgba(edited_frames[i], mask)
+                content = tensor_to_pil_rgba(edited_frames[i])
                 content = content.crop((0, 0, sprite.w, sprite.h))
                 # If the edit dropped alpha, keep the original sprite's transparency.
                 if (
-                    edited_alpha is None
-                    and edited_frames.shape[-1] < 4
+                    edited_frames.shape[-1] < 4
                     and sprite.path in fallback
                 ):
                     orig = project.crop_content(fallback[sprite.path])

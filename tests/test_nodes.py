@@ -21,7 +21,7 @@ def _make_dump(tmp_path):
     atlases.mkdir(parents=True)
     walk = root / "Walk"
     walk.mkdir()
-    Image.new("RGBA", (10, 20), (255, 0, 0, 255)).save(walk / "0.png")
+    Image.new("RGBA", (10, 20), (255, 0, 0, 128)).save(walk / "0.png")
     Image.new("RGBA", (12, 16), (0, 255, 0, 255)).save(walk / "1.png")
     info = {
         "sid": ["w0", "w1"],
@@ -43,27 +43,73 @@ def test_selector_then_pack_roundtrip(tmp_path):
     root = _make_dump(tmp_path)
 
     selector = nodes.CKAnimationSelector()
-    images, alpha, ck_frames = selector.select(root, "Knight", "Walk")
+    images, ck_frames = selector.select(root, "Knight", "Walk")
 
-    # Two frames padded to the largest size (12 x 20).
-    assert images.shape == (2, 20, 12, 3)
-    assert alpha.shape == (2, 20, 12)
+    # Two RGBA frames padded transparently to the largest size (12 x 20).
+    assert images.shape == (2, 20, 12, 4)
+    assert images[0, 0, 0, 3].item() == pytest.approx(128 / 255)
+    assert images[0, 0, 10, 3].item() == 0
     assert len(ck_frames["sprites"]) == 2
 
     packer = nodes.CKPackAtlas()
-    out = packer.pack(ck_frames, images, edited_alpha=alpha, save_to_output=False)
+    out = packer.pack(ck_frames, images, save_to_output=False)
     atlas, saved_path = out["result"]
 
     # max right = 16 + 12 = 28 -> 32 ; max top = max(20, 16) -> 32
     # RGBA: the atlas output keeps its alpha channel so transparency survives.
     assert atlas.shape == (1, 32, 32, 4)
+    assert nodes.torch.any(nodes.torch.isclose(atlas[..., 3], nodes.torch.tensor(128 / 255)))
     assert saved_path == ""
+
+
+def test_alpha_is_integrated_into_image_ports():
+    assert nodes.CKAnimationSelector.RETURN_TYPES == ("IMAGE", "CK_FRAMES")
+    assert nodes.CKAnimationSelector.RETURN_NAMES == ("frames", "ck_frames")
+
+    merge_inputs = nodes.CKMergeEdits.INPUT_TYPES()
+    assert "optional" not in merge_inputs
+    assert nodes.CKMergeEdits.RETURN_TYPES == ("CK_FRAMES", "IMAGE")
+    assert nodes.CKMergeEdits.RETURN_NAMES == ("ck_frames", "frames")
+
+    pack_inputs = nodes.CKPackAtlas.INPUT_TYPES()
+    assert "edited_alpha" not in pack_inputs["optional"]
+
+
+def test_merge_edits_preserves_rgba_and_transparent_padding():
+    frames_a = nodes.torch.ones((1, 2, 3, 4))
+    frames_a[..., 3] = 0.25
+    frames_b = nodes.torch.ones((1, 3, 2, 4))
+    frames_b[..., 3] = 0.75
+    descriptor_a = {
+        "collection": "Knight",
+        "frame_size": [3, 2],
+        "animation": "Walk",
+        "sprites": [{"path": "Walk/0.png"}],
+    }
+    descriptor_b = {
+        "collection": "Knight",
+        "frame_size": [2, 3],
+        "animation": "Idle",
+        "sprites": [{"path": "Idle/0.png"}],
+    }
+
+    merged_descriptor, merged_frames = nodes.CKMergeEdits().merge(
+        descriptor_a, frames_a, descriptor_b, frames_b
+    )
+
+    assert merged_frames.shape == (2, 3, 3, 4)
+    assert nodes.torch.all(merged_frames[0, :2, :3, 3] == 0.25)
+    assert nodes.torch.all(merged_frames[1, :3, :2, 3] == 0.75)
+    assert nodes.torch.all(merged_frames[0, 2, :, :] == 0)
+    assert nodes.torch.all(merged_frames[1, :, 2, :] == 0)
+    assert merged_descriptor["frame_size"] == [3, 3]
+    assert merged_descriptor["animation"] == "Walk+Idle"
 
 
 def test_pack_frame_count_mismatch(tmp_path):
     root = _make_dump(tmp_path)
     selector = nodes.CKAnimationSelector()
-    images, _alpha, ck_frames = selector.select(root, "Knight", "Walk")
+    images, ck_frames = selector.select(root, "Knight", "Walk")
 
     packer = nodes.CKPackAtlas()
     with pytest.raises(ValueError, match="Frame count mismatch"):
@@ -72,14 +118,14 @@ def test_pack_frame_count_mismatch(tmp_path):
 
 def test_selector_frames_sheet_roundtrip_is_exact(tmp_path):
     root = _make_dump(tmp_path)
-    frames, _alpha, _ck_frames = nodes.CKAnimationSelector().select(
+    frames, _ck_frames = nodes.CKAnimationSelector().select(
         root, "Knight", "Walk"
     )
 
     sheet, layout = nodes.CKFramesToSheet().combine(frames, columns=1)
     restored, = nodes.CKSheetToFrames().split(sheet, layout)
 
-    assert sheet.shape == (1, 40, 12, 3)
+    assert sheet.shape == (1, 40, 12, 4)
     assert restored.shape == frames.shape
     assert restored.dtype == frames.dtype
     assert restored.device == frames.device
@@ -153,13 +199,12 @@ def _make_numbered_dump(tmp_path):
 def test_selector_range_mode_concatenates_across_collections(tmp_path):
     root = _make_numbered_dump(tmp_path)
     selector = nodes.CKAnimationSelector()
-    images, alpha, ck_frames = selector.select(
+    images, ck_frames = selector.select(
         root, "", "", mode="animation range", animation_range="1-2"
     )
 
     # Three frames padded to the largest (12 x 20).
-    assert images.shape == (3, 20, 12, 3)
-    assert alpha.shape == (3, 20, 12)
+    assert images.shape == (3, 20, 12, 4)
     assert ck_frames["mode"] == "animation range"
     assert ck_frames["collection"] is None
     assert ck_frames["collections"] == ["atlas0", "atlas1"]
@@ -176,7 +221,7 @@ def test_selector_range_mode_requires_a_range(tmp_path):
 def test_pack_range_writes_one_atlas_per_collection(tmp_path):
     root = _make_numbered_dump(tmp_path)
     selector = nodes.CKAnimationSelector()
-    images, alpha, ck_frames = selector.select(
+    images, ck_frames = selector.select(
         root, "", "", mode="animation range", animation_range="1-2"
     )
 
@@ -185,7 +230,6 @@ def test_pack_range_writes_one_atlas_per_collection(tmp_path):
     out = packer.pack(
         ck_frames,
         images,
-        edited_alpha=alpha,
         save_to_output=False,
         external_directory=str(ext_dir),
     )
