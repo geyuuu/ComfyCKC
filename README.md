@@ -59,6 +59,21 @@ Frames of different sizes are padded (top-left anchored, transparent) to a
 common size so they fit in one batch; the original per-frame size is recorded
 in `ck_frames` and restored on pack.
 
+### CK Frames to Sheet / CK Sheet to Frames
+
+**CK Frames to Sheet** arranges an `IMAGE` frame batch (including the `frames`
+output of **CK Animation Selector**) into one grid image. `columns = 0` chooses
+a compact near-square grid automatically; set it to `1` for a vertical strip,
+or to the frame count for a horizontal strip. It outputs both the single
+`sheet` image and a `sheet_layout` descriptor.
+
+Connect both outputs to **CK Sheet to Frames** to recover the original ordered
+`IMAGE` batch. A direct combine/split round trip does not resize, colour-convert,
+or quantise pixels, so the recovered frames have exactly the same shape, dtype,
+device, ordering, and values as the selector output. If the sheet is resized or
+cropped between the two nodes, the splitter reports a clear shape-mismatch error
+instead of silently producing incorrect frames.
+
 ### CK Pack Atlas
 Takes the (edited) `frames` + `ck_frames` and rebuilds the **entire** atlas:
 modified frames are dropped in place, every other sprite of the collection is

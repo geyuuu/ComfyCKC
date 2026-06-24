@@ -70,6 +70,53 @@ def test_pack_frame_count_mismatch(tmp_path):
         packer.pack(ck_frames, images[:1], save_to_output=False)
 
 
+def test_selector_frames_sheet_roundtrip_is_exact(tmp_path):
+    root = _make_dump(tmp_path)
+    frames, _alpha, _ck_frames = nodes.CKAnimationSelector().select(
+        root, "Knight", "Walk"
+    )
+
+    sheet, layout = nodes.CKFramesToSheet().combine(frames, columns=1)
+    restored, = nodes.CKSheetToFrames().split(sheet, layout)
+
+    assert sheet.shape == (1, 40, 12, 3)
+    assert restored.shape == frames.shape
+    assert restored.dtype == frames.dtype
+    assert restored.device == frames.device
+    assert nodes.torch.equal(restored, frames)
+
+
+def test_frames_sheet_auto_grid_and_roundtrip_are_exact():
+    frames = nodes.torch.arange(5 * 2 * 3 * 4, dtype=nodes.torch.float32).reshape(
+        5, 2, 3, 4
+    )
+
+    sheet, layout = nodes.CKFramesToSheet().combine(frames)
+    restored, = nodes.CKSheetToFrames().split(sheet, layout)
+
+    assert sheet.shape == (1, 4, 9, 4)
+    assert layout == {
+        "version": 1,
+        "frame_count": 5,
+        "frame_height": 2,
+        "frame_width": 3,
+        "channels": 4,
+        "columns": 3,
+        "rows": 2,
+    }
+    assert nodes.torch.equal(restored, frames)
+    # The unused final grid cell is transparent/black rather than duplicated.
+    assert nodes.torch.count_nonzero(sheet[:, 2:4, 6:9, :]) == 0
+
+
+def test_sheet_split_rejects_a_resized_sheet():
+    frames = nodes.torch.zeros((2, 4, 5, 3))
+    sheet, layout = nodes.CKFramesToSheet().combine(frames)
+
+    with pytest.raises(ValueError, match="Sheet shape mismatch"):
+        nodes.CKSheetToFrames().split(sheet[:, :-1], layout)
+
+
 def _make_numbered_dump(tmp_path):
     """Numbered animation folders split across two atlases (collections)."""
     base = tmp_path / "Skin"

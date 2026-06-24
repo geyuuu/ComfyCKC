@@ -21,6 +21,7 @@ workflows and inspection convenient.
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 
@@ -264,6 +265,145 @@ class CKAnimationSelector:
             "sprites": [s.to_dict() for s in sprites],
         }
         return (images, masks, ck_frames)
+
+
+# ---------------------------------------------------------------------------
+# Reversible frame-sheet helpers
+# ---------------------------------------------------------------------------
+class CKFramesToSheet:
+    """Arrange an IMAGE batch on one image without changing pixel values."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "frames": ("IMAGE",),
+                "columns": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 4096,
+                        "tooltip": (
+                            "Grid columns. 0 chooses a compact, near-square grid; "
+                            "1 makes a vertical strip."
+                        ),
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "CK_FRAME_SHEET")
+    RETURN_NAMES = ("sheet", "sheet_layout")
+    FUNCTION = "combine"
+    CATEGORY = CATEGORY
+    DESCRIPTION = (
+        "Arrange every frame in an IMAGE batch on one grid image. The layout "
+        "output lets CK Sheet to Frames restore the original batch exactly."
+    )
+
+    def combine(self, frames: torch.Tensor, columns: int = 0):
+        if frames.dim() != 4:
+            raise ValueError(
+                "CK Frames to Sheet expects an IMAGE batch shaped [frames, height, width, channels]."
+            )
+
+        frame_count, frame_height, frame_width, channels = frames.shape
+        if frame_count < 1:
+            raise ValueError("CK Frames to Sheet received an empty frame batch.")
+        if frame_height < 1 or frame_width < 1 or channels < 1:
+            raise ValueError("CK Frames to Sheet received frames with an invalid shape.")
+
+        columns = int(columns)
+        if columns <= 0:
+            columns = math.ceil(math.sqrt(frame_count))
+        columns = min(columns, frame_count)
+        rows = math.ceil(frame_count / columns)
+
+        # new_zeros retains the input tensor's dtype and device. Direct slice
+        # assignment performs no resize, colour conversion, or quantisation.
+        sheet = frames.new_zeros(
+            (1, rows * frame_height, columns * frame_width, channels)
+        )
+        for index in range(frame_count):
+            row, column = divmod(index, columns)
+            y = row * frame_height
+            x = column * frame_width
+            sheet[0, y : y + frame_height, x : x + frame_width, :] = frames[index]
+
+        layout = {
+            "version": 1,
+            "frame_count": frame_count,
+            "frame_height": frame_height,
+            "frame_width": frame_width,
+            "channels": channels,
+            "columns": columns,
+            "rows": rows,
+        }
+        return (sheet, layout)
+
+
+class CKSheetToFrames:
+    """Restore the IMAGE batch described by a CK_FRAME_SHEET layout."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sheet": ("IMAGE",),
+                "sheet_layout": ("CK_FRAME_SHEET",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("frames",)
+    FUNCTION = "split"
+    CATEGORY = CATEGORY
+    DESCRIPTION = (
+        "Split an image made by CK Frames to Sheet back into its original "
+        "ordered IMAGE batch, with identical frame dimensions and values."
+    )
+
+    def split(self, sheet: torch.Tensor, sheet_layout):
+        if sheet.dim() != 4 or sheet.shape[0] != 1:
+            raise ValueError("CK Sheet to Frames expects exactly one sheet image.")
+        if not isinstance(sheet_layout, dict) or sheet_layout.get("version") != 1:
+            raise ValueError("CK Sheet to Frames received an unsupported sheet layout.")
+
+        keys = (
+            "frame_count",
+            "frame_height",
+            "frame_width",
+            "channels",
+            "columns",
+            "rows",
+        )
+        try:
+            frame_count, frame_height, frame_width, channels, columns, rows = (
+                int(sheet_layout[key]) for key in keys
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("CK Sheet to Frames received an invalid sheet layout.") from exc
+
+        if min(frame_count, frame_height, frame_width, channels, columns, rows) < 1:
+            raise ValueError("CK Sheet to Frames received an invalid sheet layout.")
+        expected_shape = (rows * frame_height, columns * frame_width, channels)
+        if tuple(sheet.shape[1:]) != expected_shape:
+            raise ValueError(
+                "Sheet shape mismatch: layout expects "
+                f"[1, {expected_shape[0]}, {expected_shape[1]}, {expected_shape[2]}] "
+                f"but received {list(sheet.shape)}. Was the sheet resized or cropped?"
+            )
+        if frame_count > rows * columns:
+            raise ValueError("CK Sheet to Frames layout has more frames than grid cells.")
+
+        frames: list[torch.Tensor] = []
+        for index in range(frame_count):
+            row, column = divmod(index, columns)
+            y = row * frame_height
+            x = column * frame_width
+            frames.append(sheet[:, y : y + frame_height, x : x + frame_width, :])
+        return (torch.cat(frames, dim=0),)
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +705,8 @@ class CKLoadProjectInfo:
 
 NODE_CLASS_MAPPINGS = {
     "CKAnimationSelector": CKAnimationSelector,
+    "CKFramesToSheet": CKFramesToSheet,
+    "CKSheetToFrames": CKSheetToFrames,
     "CKPackAtlas": CKPackAtlas,
     "CKMergeEdits": CKMergeEdits,
     "CKLoadProjectInfo": CKLoadProjectInfo,
@@ -572,6 +714,8 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CKAnimationSelector": "CK Animation Selector",
+    "CKFramesToSheet": "CK Frames to Sheet",
+    "CKSheetToFrames": "CK Sheet to Frames",
     "CKPackAtlas": "CK Pack Atlas",
     "CKMergeEdits": "CK Merge Edits",
     "CKLoadProjectInfo": "CK Project Info",
