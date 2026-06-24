@@ -245,8 +245,60 @@ class CKAnimationSelector:
 # ---------------------------------------------------------------------------
 # Reversible frame-sheet helpers
 # ---------------------------------------------------------------------------
+_SHEET_ALIGNMENT = 16
+_SHEET_MIN_PIXELS = 655_360
+_SHEET_MAX_PIXELS = 8_294_400
+
+
+def _frame_sheet_size(content_width: int, content_height: int) -> tuple[int, int]:
+    """Return a lossless, 16-aligned sheet size within custom-resolution limits."""
+    alignment = _SHEET_ALIGNMENT
+    sheet_width = ((content_width + alignment - 1) // alignment) * alignment
+    sheet_height = ((content_height + alignment - 1) // alignment) * alignment
+    pixel_count = sheet_width * sheet_height
+
+    if pixel_count > _SHEET_MAX_PIXELS:
+        raise ValueError(
+            "CK Frames to Sheet cannot make a lossless custom-resolution sheet: "
+            f"the {sheet_width}x{sheet_height} aligned frame grid contains "
+            f"{pixel_count:,} pixels, exceeding the {_SHEET_MAX_PIXELS:,} maximum. "
+            "Use a different column count or fewer/smaller frames."
+        )
+    if pixel_count >= _SHEET_MIN_PIXELS:
+        return sheet_width, sheet_height
+
+    # Grow toward the minimum while preserving the content grid's aspect ratio.
+    # Rounding both dimensions upward keeps the final area at or above the
+    # minimum; an already-constraining content dimension is never reduced.
+    aspect_ratio = content_width / content_height
+    target_width = math.sqrt(_SHEET_MIN_PIXELS * aspect_ratio)
+    target_height = math.sqrt(_SHEET_MIN_PIXELS / aspect_ratio)
+    if target_width < sheet_width:
+        target_width = sheet_width
+        target_height = max(target_height, _SHEET_MIN_PIXELS / target_width)
+    elif target_height < sheet_height:
+        target_height = sheet_height
+        target_width = max(target_width, _SHEET_MIN_PIXELS / target_height)
+
+    sheet_width = max(
+        sheet_width,
+        math.ceil(target_width / alignment) * alignment,
+    )
+    sheet_height = max(
+        sheet_height,
+        math.ceil(target_height / alignment) * alignment,
+    )
+    pixel_count = sheet_width * sheet_height
+    if not _SHEET_MIN_PIXELS <= pixel_count <= _SHEET_MAX_PIXELS:
+        raise ValueError(
+            "CK Frames to Sheet could not satisfy the custom-resolution pixel limits "
+            "without resizing frame pixels."
+        )
+    return sheet_width, sheet_height
+
+
 class CKFramesToSheet:
-    """Arrange an IMAGE batch on one image without changing pixel values."""
+    """Arrange an IMAGE batch on a 16-aligned sheet without changing pixels."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -274,7 +326,9 @@ class CKFramesToSheet:
     CATEGORY = CATEGORY
     DESCRIPTION = (
         "Arrange every frame in an IMAGE batch on one grid image. The layout "
-        "output lets CK Sheet to Frames restore the original batch exactly."
+        "is transparently padded to a multiple of 16 in both dimensions and "
+        "between 655,360 and 8,294,400 total pixels. CK Sheet to Frames then "
+        "restores the original batch exactly."
     )
 
     def combine(self, frames: torch.Tensor, columns: int = 0):
@@ -294,12 +348,15 @@ class CKFramesToSheet:
             columns = math.ceil(math.sqrt(frame_count))
         columns = min(columns, frame_count)
         rows = math.ceil(frame_count / columns)
+        content_height = rows * frame_height
+        content_width = columns * frame_width
+        sheet_width, sheet_height = _frame_sheet_size(content_width, content_height)
 
         # new_zeros retains the input tensor's dtype and device. Direct slice
         # assignment performs no resize, colour conversion, or quantisation.
-        sheet = frames.new_zeros(
-            (1, rows * frame_height, columns * frame_width, channels)
-        )
+        # Alignment padding is added only to the right and bottom, outside all
+        # frame cells, so it can never become part of a restored frame.
+        sheet = frames.new_zeros((1, sheet_height, sheet_width, channels))
         for index in range(frame_count):
             row, column = divmod(index, columns)
             y = row * frame_height
@@ -307,13 +364,15 @@ class CKFramesToSheet:
             sheet[0, y : y + frame_height, x : x + frame_width, :] = frames[index]
 
         layout = {
-            "version": 1,
+            "version": 3,
             "frame_count": frame_count,
             "frame_height": frame_height,
             "frame_width": frame_width,
             "channels": channels,
             "columns": columns,
             "rows": rows,
+            "sheet_height": sheet_height,
+            "sheet_width": sheet_width,
         }
         return (sheet, layout)
 
@@ -342,7 +401,10 @@ class CKSheetToFrames:
     def split(self, sheet: torch.Tensor, sheet_layout):
         if sheet.dim() != 4 or sheet.shape[0] != 1:
             raise ValueError("CK Sheet to Frames expects exactly one sheet image.")
-        if not isinstance(sheet_layout, dict) or sheet_layout.get("version") != 1:
+        if (
+            not isinstance(sheet_layout, dict)
+            or sheet_layout.get("version") not in (1, 2, 3)
+        ):
             raise ValueError("CK Sheet to Frames received an unsupported sheet layout.")
 
         keys = (
@@ -362,7 +424,46 @@ class CKSheetToFrames:
 
         if min(frame_count, frame_height, frame_width, channels, columns, rows) < 1:
             raise ValueError("CK Sheet to Frames received an invalid sheet layout.")
-        expected_shape = (rows * frame_height, columns * frame_width, channels)
+        if sheet_layout["version"] in (2, 3):
+            try:
+                sheet_height = int(sheet_layout["sheet_height"])
+                sheet_width = int(sheet_layout["sheet_width"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "CK Sheet to Frames received an invalid sheet layout."
+                ) from exc
+            content_height = rows * frame_height
+            content_width = columns * frame_width
+            if sheet_layout["version"] == 2:
+                expected_height = ((content_height + 15) // 16) * 16
+                expected_width = ((content_width + 15) // 16) * 16
+                valid_size = (sheet_height, sheet_width) == (
+                    expected_height,
+                    expected_width,
+                )
+            else:
+                pixel_count = sheet_height * sheet_width
+                valid_size = (
+                    sheet_height % _SHEET_ALIGNMENT == 0
+                    and sheet_width % _SHEET_ALIGNMENT == 0
+                    and sheet_height >= content_height
+                    and sheet_width >= content_width
+                    and _SHEET_MIN_PIXELS <= pixel_count <= _SHEET_MAX_PIXELS
+                )
+            if not valid_size:
+                raise ValueError("CK Sheet to Frames received an invalid sheet layout.")
+        else:
+            # Backward compatibility for layouts created before sheet padding
+            # was introduced.
+            sheet_height = rows * frame_height
+            sheet_width = columns * frame_width
+
+        content_height = rows * frame_height
+        content_width = columns * frame_width
+        if sheet_height < content_height or sheet_width < content_width:
+            raise ValueError("CK Sheet to Frames received an invalid sheet layout.")
+
+        expected_shape = (sheet_height, sheet_width, channels)
         if tuple(sheet.shape[1:]) != expected_shape:
             raise ValueError(
                 "Sheet shape mismatch: layout expects "

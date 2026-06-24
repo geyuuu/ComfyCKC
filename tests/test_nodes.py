@@ -125,7 +125,10 @@ def test_selector_frames_sheet_roundtrip_is_exact(tmp_path):
     sheet, layout = nodes.CKFramesToSheet().combine(frames, columns=1)
     restored, = nodes.CKSheetToFrames().split(sheet, layout)
 
-    assert sheet.shape == (1, 40, 12, 4)
+    assert sheet.shape == (1, 1488, 448, 4)
+    assert sheet.shape[1] % 16 == 0
+    assert sheet.shape[2] % 16 == 0
+    assert 655_360 <= sheet.shape[1] * sheet.shape[2] <= 8_294_400
     assert restored.shape == frames.shape
     assert restored.dtype == frames.dtype
     assert restored.device == frames.device
@@ -140,19 +143,24 @@ def test_frames_sheet_auto_grid_and_roundtrip_are_exact():
     sheet, layout = nodes.CKFramesToSheet().combine(frames)
     restored, = nodes.CKSheetToFrames().split(sheet, layout)
 
-    assert sheet.shape == (1, 4, 9, 4)
+    assert sheet.shape == (1, 544, 1216, 4)
     assert layout == {
-        "version": 1,
+        "version": 3,
         "frame_count": 5,
         "frame_height": 2,
         "frame_width": 3,
         "channels": 4,
         "columns": 3,
         "rows": 2,
+        "sheet_height": 544,
+        "sheet_width": 1216,
     }
     assert nodes.torch.equal(restored, frames)
     # The unused final grid cell is transparent/black rather than duplicated.
     assert nodes.torch.count_nonzero(sheet[:, 2:4, 6:9, :]) == 0
+    # Right/bottom alignment padding is transparent/black too.
+    assert nodes.torch.count_nonzero(sheet[:, 4:, :, :]) == 0
+    assert nodes.torch.count_nonzero(sheet[:, :, 9:, :]) == 0
 
 
 def test_sheet_split_rejects_a_resized_sheet():
@@ -161,6 +169,13 @@ def test_sheet_split_rejects_a_resized_sheet():
 
     with pytest.raises(ValueError, match="Sheet shape mismatch"):
         nodes.CKSheetToFrames().split(sheet[:, :-1], layout)
+
+
+def test_frames_sheet_rejects_a_grid_above_custom_resolution_maximum():
+    frames = nodes.torch.zeros((1, 2881, 2881, 1), dtype=nodes.torch.uint8)
+
+    with pytest.raises(ValueError, match="exceeding the 8,294,400 maximum"):
+        nodes.CKFramesToSheet().combine(frames)
 
 
 def _make_numbered_dump(tmp_path):

@@ -66,6 +66,15 @@ a compact near-square grid automatically; set it to `1` for a vertical strip,
 or to the frame count for a horizontal strip. It outputs both the single
 `sheet` image and a `sheet_layout` descriptor.
 
+The sheet is transparently padded on its right and bottom edges so both its
+width and height are multiples of 16 and its total pixel count is between
+**655,360 and 8,294,400**. When the frame grid is smaller than the minimum, both
+canvas dimensions grow while approximately preserving the grid's aspect ratio.
+No frame pixels are resized or moved. If the aligned frame grid itself exceeds
+the maximum, the node reports an error because it cannot meet the limit without
+losing pixels; changing `columns`, reducing the frame count, or reducing the
+source frame size is then required.
+
 Connect both outputs to **CK Sheet to Frames** to recover the original ordered
 `IMAGE` batch. A direct combine/split round trip does not resize, colour-convert,
 or quantise pixels, so the recovered frames have exactly the same shape, dtype,
