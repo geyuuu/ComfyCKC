@@ -1,5 +1,7 @@
 # ComfyUI CustomKnight Creator
 
+![ComfyUI CustomKnight Creator](assets\ckc.gif)
+
 A ComfyUI custom-node port of
 [CustomKnight-Creator](https://github.com/cmot17/CustomKnight-Creator) — the
 desktop tool for building [Hollow Knight](https://www.hollowknight.com/)
