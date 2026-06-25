@@ -82,6 +82,9 @@ def test_alpha_is_integrated_into_image_ports():
     assert list(pack_inputs["required"]) == ["edited_frames", "ck_frames"]
     assert "edited_alpha" not in pack_inputs["optional"]
 
+    assert nodes.CKSaveFramesDescriptor.RETURN_NAMES == ("ck_frames", "saved_path")
+    assert nodes.CKLoadFramesDescriptor.RETURN_NAMES == ("ck_frames", "loaded_path")
+
 
 def test_merge_edits_preserves_rgba_and_transparent_padding():
     frames_a = nodes.torch.ones((1, 2, 3, 4))
@@ -171,6 +174,22 @@ def test_pack_frame_count_mismatch(tmp_path):
     packer = nodes.CKPackAtlas()
     with pytest.raises(ValueError, match="Frame count mismatch"):
         packer.pack(images[:1], ck_frames, save_to_output=False)
+
+
+def test_ck_frames_descriptor_save_load_roundtrip(tmp_path):
+    root = _make_dump(tmp_path)
+    _images, ck_frames = nodes.CKAnimationSelector().select(root, "Knight", "Walk")
+    path = tmp_path / "descriptors" / "walk.ck_frames.json"
+
+    saved_descriptor, saved_path = nodes.CKSaveFramesDescriptor().save(
+        ck_frames, str(path)
+    )
+    loaded_descriptor, loaded_path = nodes.CKLoadFramesDescriptor().load(str(path))
+
+    assert saved_descriptor == ck_frames
+    assert loaded_descriptor == ck_frames
+    assert saved_path == str(path.resolve())
+    assert loaded_path == str(path.resolve())
 
 
 def test_selector_frames_sheet_roundtrip_is_exact(tmp_path):

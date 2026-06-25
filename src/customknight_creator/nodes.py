@@ -858,6 +858,110 @@ class CKPackAtlas:
 
 
 # ---------------------------------------------------------------------------
+# CK_FRAMES JSON persistence
+# ---------------------------------------------------------------------------
+class CKSaveFramesDescriptor:
+    """Save a CK_FRAMES descriptor as JSON and pass it through."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ck_frames": ("CK_FRAMES",),
+                "path": (
+                    "STRING",
+                    {
+                        "default": "ck_frames.json",
+                        "tooltip": "JSON file path to write, e.g. C:/skin/walk.ck_frames.json.",
+                    },
+                ),
+            },
+            "optional": {
+                "overwrite": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("CK_FRAMES", "STRING")
+    RETURN_NAMES = ("ck_frames", "saved_path")
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+    CATEGORY = CATEGORY
+    DESCRIPTION = "Save a CK_FRAMES layout descriptor to a JSON file."
+
+    def save(self, ck_frames, path: str, overwrite=True):
+        _validate_ck_frames_descriptor(ck_frames)
+        resolved = _resolve_descriptor_path(path)
+        if os.path.exists(resolved) and not overwrite:
+            raise FileExistsError(f"CK_FRAMES descriptor already exists: {resolved}")
+        parent = os.path.dirname(resolved)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(resolved, "w", encoding="utf-8") as fh:
+            json.dump(ck_frames, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        return (ck_frames, resolved)
+
+
+class CKLoadFramesDescriptor:
+    """Load a CK_FRAMES descriptor from JSON."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "path": (
+                    "STRING",
+                    {
+                        "default": "ck_frames.json",
+                        "tooltip": "JSON file path previously written by CK Save Frames Descriptor.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("CK_FRAMES", "STRING")
+    RETURN_NAMES = ("ck_frames", "loaded_path")
+    FUNCTION = "load"
+    CATEGORY = CATEGORY
+    DESCRIPTION = "Load a CK_FRAMES layout descriptor from a JSON file."
+
+    def load(self, path: str):
+        resolved = _resolve_descriptor_path(path)
+        with open(resolved, "r", encoding="utf-8") as fh:
+            ck_frames = json.load(fh)
+        _validate_ck_frames_descriptor(ck_frames)
+        return (ck_frames, resolved)
+
+
+def _resolve_descriptor_path(path: str) -> str:
+    path = str(path or "").strip().strip('"')
+    if not path:
+        raise ValueError("CK_FRAMES descriptor path cannot be empty.")
+    if os.path.isdir(path):
+        path = os.path.join(path, "ck_frames.json")
+    if not os.path.splitext(path)[1]:
+        path = f"{path}.json"
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _validate_ck_frames_descriptor(value):
+    if not isinstance(value, dict):
+        raise ValueError("CK_FRAMES descriptor must be a JSON object.")
+    missing = [
+        key
+        for key in ("root_folders", "frame_size", "sprites")
+        if key not in value
+    ]
+    if missing:
+        raise ValueError(
+            "CK_FRAMES descriptor is missing required field(s): "
+            + ", ".join(missing)
+        )
+    if not isinstance(value["sprites"], list):
+        raise ValueError("CK_FRAMES descriptor field 'sprites' must be a list.")
+
+
+# ---------------------------------------------------------------------------
 # CKLoadProjectInfo (inspection helper)
 # ---------------------------------------------------------------------------
 class CKLoadProjectInfo:
@@ -899,6 +1003,8 @@ NODE_CLASS_MAPPINGS = {
     "CKSheetToFrames": CKSheetToFrames,
     "CKPackAtlas": CKPackAtlas,
     "CKMergeEdits": CKMergeEdits,
+    "CKSaveFramesDescriptor": CKSaveFramesDescriptor,
+    "CKLoadFramesDescriptor": CKLoadFramesDescriptor,
     "CKLoadProjectInfo": CKLoadProjectInfo,
 }
 
@@ -908,6 +1014,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CKSheetToFrames": "CK Sheet to Frames",
     "CKPackAtlas": "CK Pack Atlas",
     "CKMergeEdits": "CK Merge Edits",
+    "CKSaveFramesDescriptor": "CK Save Frames Descriptor",
+    "CKLoadFramesDescriptor": "CK Load Frames Descriptor",
     "CKLoadProjectInfo": "CK Project Info",
 }
 

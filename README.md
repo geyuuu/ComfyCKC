@@ -119,6 +119,13 @@ they pack together. Use **Add edit pair** on the node to append as many extra
 several collections from the same project, the packer writes one atlas per
 collection.
 
+### CK Save / Load Frames Descriptor
+Save `ck_frames` to a JSON file and load it back later. This stores only the
+layout descriptor (`root_folders`, `frame_size`, sprite list, collections, etc.),
+not the image pixels, so save the edited `frames` separately if you need a full
+disk round-trip. The original CustomKnight dump path still needs to exist when
+packing, because `CK Pack Atlas` reads unchanged sprites from disk.
+
 ### CK Project Info
 Inspect a dump: prints the base path, every collection (with computed atlas
 size) and its animations / frame counts. Handy for finding the right names.
