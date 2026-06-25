@@ -52,7 +52,7 @@ def test_selector_then_pack_roundtrip(tmp_path):
     assert len(ck_frames["sprites"]) == 2
 
     packer = nodes.CKPackAtlas()
-    out = packer.pack(ck_frames, images, save_to_output=False)
+    out = packer.pack(images, ck_frames, save_to_output=False)
     atlas, saved_path = out["result"]
 
     # max right = 16 + 12 = 28 -> 32 ; max top = max(20, 16) -> 32
@@ -67,11 +67,19 @@ def test_alpha_is_integrated_into_image_ports():
     assert nodes.CKAnimationSelector.RETURN_NAMES == ("frames", "ck_frames")
 
     merge_inputs = nodes.CKMergeEdits.INPUT_TYPES()
-    assert "optional" not in merge_inputs
+    assert list(merge_inputs["required"]) == [
+        "frames_a",
+        "ck_frames_a",
+        "frames_b",
+        "ck_frames_b",
+    ]
+    assert merge_inputs["optional"]["frames_3"] == ("IMAGE",)
+    assert merge_inputs["optional"]["ck_frames_3"] == ("CK_FRAMES",)
     assert nodes.CKMergeEdits.RETURN_TYPES == ("CK_FRAMES", "IMAGE")
     assert nodes.CKMergeEdits.RETURN_NAMES == ("ck_frames", "frames")
 
     pack_inputs = nodes.CKPackAtlas.INPUT_TYPES()
+    assert list(pack_inputs["required"]) == ["edited_frames", "ck_frames"]
     assert "edited_alpha" not in pack_inputs["optional"]
 
 
@@ -80,30 +88,79 @@ def test_merge_edits_preserves_rgba_and_transparent_padding():
     frames_a[..., 3] = 0.25
     frames_b = nodes.torch.ones((1, 3, 2, 4))
     frames_b[..., 3] = 0.75
+    frames_c = nodes.torch.ones((1, 1, 4, 4))
+    frames_c[..., 3] = 0.5
     descriptor_a = {
         "collection": "Knight",
+        "collections": ["Knight"],
         "frame_size": [3, 2],
         "animation": "Walk",
         "sprites": [{"path": "Walk/0.png"}],
     }
     descriptor_b = {
         "collection": "Knight",
+        "collections": ["Knight"],
         "frame_size": [2, 3],
         "animation": "Idle",
         "sprites": [{"path": "Idle/0.png"}],
     }
+    descriptor_c = {
+        "collection": "Knight",
+        "collections": ["Knight"],
+        "frame_size": [4, 1],
+        "animation": "Jump",
+        "sprites": [{"path": "Jump/0.png"}],
+    }
 
     merged_descriptor, merged_frames = nodes.CKMergeEdits().merge(
-        descriptor_a, frames_a, descriptor_b, frames_b
+        frames_a,
+        descriptor_a,
+        frames_b,
+        descriptor_b,
+        frames_3=frames_c,
+        ck_frames_3=descriptor_c,
     )
 
-    assert merged_frames.shape == (2, 3, 3, 4)
+    assert merged_frames.shape == (3, 3, 4, 4)
     assert nodes.torch.all(merged_frames[0, :2, :3, 3] == 0.25)
     assert nodes.torch.all(merged_frames[1, :3, :2, 3] == 0.75)
+    assert nodes.torch.all(merged_frames[2, :1, :4, 3] == 0.5)
     assert nodes.torch.all(merged_frames[0, 2, :, :] == 0)
-    assert nodes.torch.all(merged_frames[1, :, 2, :] == 0)
-    assert merged_descriptor["frame_size"] == [3, 3]
-    assert merged_descriptor["animation"] == "Walk+Idle"
+    assert nodes.torch.all(merged_frames[1, :, 2:, :] == 0)
+    assert nodes.torch.all(merged_frames[2, 1:, :, :] == 0)
+    assert merged_descriptor["frame_size"] == [4, 3]
+    assert merged_descriptor["animation"] == "Walk+Idle+Jump"
+
+
+def test_merge_edits_can_merge_multiple_collections():
+    frames_a = nodes.torch.ones((1, 2, 2, 4))
+    frames_b = nodes.torch.ones((1, 2, 2, 4))
+    descriptor_a = {
+        "root_folders": "Skin",
+        "basepath": "Skin",
+        "collection": "atlas0",
+        "collections": ["atlas0"],
+        "frame_size": [2, 2],
+        "animation": "Walk",
+        "sprites": [{"collection": "atlas0", "path": "Walk/0.png"}],
+    }
+    descriptor_b = {
+        "root_folders": "Skin",
+        "basepath": "Skin",
+        "collection": "atlas1",
+        "collections": ["atlas1"],
+        "frame_size": [2, 2],
+        "animation": "Idle",
+        "sprites": [{"collection": "atlas1", "path": "Idle/0.png"}],
+    }
+
+    merged_descriptor, merged_frames = nodes.CKMergeEdits().merge(
+        frames_a, descriptor_a, frames_b, descriptor_b
+    )
+
+    assert merged_frames.shape == (2, 2, 2, 4)
+    assert merged_descriptor["collection"] is None
+    assert merged_descriptor["collections"] == ["atlas0", "atlas1"]
 
 
 def test_pack_frame_count_mismatch(tmp_path):
@@ -113,7 +170,7 @@ def test_pack_frame_count_mismatch(tmp_path):
 
     packer = nodes.CKPackAtlas()
     with pytest.raises(ValueError, match="Frame count mismatch"):
-        packer.pack(ck_frames, images[:1], save_to_output=False)
+        packer.pack(images[:1], ck_frames, save_to_output=False)
 
 
 def test_selector_frames_sheet_roundtrip_is_exact(tmp_path):
@@ -243,8 +300,8 @@ def test_pack_range_writes_one_atlas_per_collection(tmp_path):
     ext_dir = tmp_path / "skin"
     packer = nodes.CKPackAtlas()
     out = packer.pack(
-        ck_frames,
         images,
+        ck_frames,
         save_to_output=False,
         external_directory=str(ext_dir),
     )

@@ -486,17 +486,18 @@ class CKSheetToFrames:
 # CKMergeEdits
 # ---------------------------------------------------------------------------
 class CKMergeEdits:
-    """Combine two animations' edits (same collection) for a single pack."""
+    """Combine any number of edited animation batches for a single pack."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "frames_a": ("IMAGE",),
                 "ck_frames_a": ("CK_FRAMES",),
-                "images_a": ("IMAGE",),
+                "frames_b": ("IMAGE",),
                 "ck_frames_b": ("CK_FRAMES",),
-                "images_b": ("IMAGE",),
             },
+            "optional": _CKMergeOptionalInputs(),
         }
 
     RETURN_TYPES = ("CK_FRAMES", "IMAGE")
@@ -504,30 +505,171 @@ class CKMergeEdits:
     FUNCTION = "merge"
     CATEGORY = CATEGORY
     DESCRIPTION = (
-        "Merge two edited animations from the same collection so they can be "
-        "packed together. Chain multiple of these for more animations."
+        "Merge any number of edited animation frame/CK_FRAMES pairs so they "
+        "can be packed together."
     )
 
-    def merge(self, ck_frames_a, images_a, ck_frames_b, images_b):
-        if ck_frames_a["collection"] != ck_frames_b["collection"]:
+    def merge(
+        self,
+        frames_a=None,
+        ck_frames_a=None,
+        frames_b=None,
+        ck_frames_b=None,
+        **kwargs,
+    ):
+        if isinstance(frames_a, dict) and hasattr(ck_frames_a, "dim"):
+            frames_a, ck_frames_a = ck_frames_a, frames_a
+        if isinstance(frames_b, dict) and hasattr(ck_frames_b, "dim"):
+            frames_b, ck_frames_b = ck_frames_b, frames_b
+
+        pairs = _collect_merge_pairs(
+            frames_a,
+            ck_frames_a,
+            frames_b,
+            ck_frames_b,
+            kwargs,
+        )
+        _validate_merge_pairs(pairs)
+
+        max_w = max(
+            max(int(desc["frame_size"][0]), int(frames.shape[2]))
+            for _, frames, desc in pairs
+        )
+        max_h = max(
+            max(int(desc["frame_size"][1]), int(frames.shape[1]))
+            for _, frames, desc in pairs
+        )
+
+        frames = torch.cat(
+            [_pad_batch(batch, max_w, max_h, 0.0) for _, batch, _ in pairs],
+            0,
+        )
+
+        merged = dict(pairs[0][2])
+        merged["frame_size"] = [max_w, max_h]
+        merged["animation"] = "+".join(
+            str(desc.get("animation", "")) for _, _, desc in pairs
+            if desc.get("animation", "")
+        )
+        merged["sprites"] = [
+            sprite
+            for _, _, desc in pairs
+            for sprite in list(desc["sprites"])
+        ]
+        collections = _merge_collections([desc for _, _, desc in pairs])
+        merged["collections"] = collections
+        merged["collection"] = collections[0] if len(collections) == 1 else None
+        return (merged, frames)
+
+
+class _CKMergeOptionalInputs(dict):
+    """ComfyUI validator hook for dynamic frames_N / ck_frames_N inputs."""
+
+    def __contains__(self, key):
+        return self._input_type_for(key) is not None
+
+    def __getitem__(self, key):
+        input_type = self._input_type_for(key)
+        if input_type is None:
+            raise KeyError(key)
+        return input_type
+
+    def get(self, key, default=None):
+        return self._input_type_for(key) or default
+
+    @staticmethod
+    def _input_type_for(key):
+        if _has_numeric_suffix(key, "ck_frames_"):
+            return ("CK_FRAMES",)
+        if _has_numeric_suffix(key, "frames_") or _has_numeric_suffix(key, "images_"):
+            return ("IMAGE",)
+        return None
+
+
+def _has_numeric_suffix(value: str, prefix: str) -> bool:
+    return value.startswith(prefix) and value[len(prefix):].isdigit()
+
+
+def _collect_merge_pairs(
+    frames_a,
+    ck_frames_a,
+    frames_b,
+    ck_frames_b,
+    kwargs,
+):
+    pairs = []
+
+    def add_pair(label, frames, ck_frames):
+        if frames is None and ck_frames is None:
+            return
+        if frames is None or ck_frames is None:
             raise ValueError(
-                "Cannot merge edits from different collections: "
-                f'"{ck_frames_a["collection"]}" vs "{ck_frames_b["collection"]}".'
+                f"CK Merge Edits input pair {label} must include both "
+                "frames and ck_frames."
+            )
+        pairs.append((label, frames, ck_frames))
+
+    add_pair("a", frames_a if frames_a is not None else kwargs.get("images_a"), ck_frames_a)
+    add_pair("b", frames_b if frames_b is not None else kwargs.get("images_b"), ck_frames_b)
+
+    indices = sorted(
+        {
+            int(name.rsplit("_", 1)[1])
+            for name in kwargs
+            if (
+                _has_numeric_suffix(name, "ck_frames_")
+                or _has_numeric_suffix(name, "frames_")
+                or _has_numeric_suffix(name, "images_")
+            )
+        }
+    )
+    for index in indices:
+        frames_key = f"frames_{index}"
+        images_key = f"images_{index}"
+        add_pair(
+            str(index),
+            kwargs.get(frames_key) if frames_key in kwargs else kwargs.get(images_key),
+            kwargs.get(f"ck_frames_{index}"),
+        )
+
+    if len(pairs) < 2:
+        raise ValueError("CK Merge Edits needs at least two frame/ck_frames pairs.")
+    return pairs
+
+
+def _validate_merge_pairs(pairs):
+    channel_counts = {int(frames.shape[-1]) for _, frames, _ in pairs}
+    if len(channel_counts) != 1:
+        raise ValueError("CK Merge Edits cannot merge IMAGE batches with different channel counts.")
+
+    for label, frames, desc in pairs:
+        if frames.dim() != 4:
+            raise ValueError(
+                f"CK Merge Edits input pair {label} has frames shaped "
+                f"{list(frames.shape)}; expected [frames, height, width, channels]."
+            )
+        if frames.shape[0] != len(desc["sprites"]):
+            raise ValueError(
+                f"CK Merge Edits input pair {label} describes {len(desc['sprites'])} "
+                f"sprite(s) but received {frames.shape[0]} frame(s)."
             )
 
-        size_a = ck_frames_a["frame_size"]
-        size_b = ck_frames_b["frame_size"]
-        max_w = max(size_a[0], size_b[0], images_a.shape[2], images_b.shape[2])
-        max_h = max(size_a[1], size_b[1], images_a.shape[1], images_b.shape[1])
+    for field in ("root_folders", "basepath"):
+        values = [desc.get(field) for _, _, desc in pairs if desc.get(field) is not None]
+        if values and any(value != values[0] for value in values[1:]):
+            raise ValueError(f"CK Merge Edits cannot merge descriptors from different {field}.")
 
-        images = _pad_batch(images_a, max_w, max_h, 0.0)
-        images = torch.cat([images, _pad_batch(images_b, max_w, max_h, 0.0)], 0)
 
-        merged = dict(ck_frames_a)
-        merged["frame_size"] = [max_w, max_h]
-        merged["animation"] = f'{ck_frames_a.get("animation", "")}+{ck_frames_b.get("animation", "")}'
-        merged["sprites"] = list(ck_frames_a["sprites"]) + list(ck_frames_b["sprites"])
-        return (merged, images)
+def _merge_collections(descriptors):
+    collections = []
+    for desc in descriptors:
+        names = desc.get("collections")
+        if not names and desc.get("collection") is not None:
+            names = [desc["collection"]]
+        for name in names or []:
+            if name not in collections:
+                collections.append(name)
+    return collections
 
 
 def _pad_batch(batch: torch.Tensor, w: int, h: int, fill: float) -> torch.Tensor:
@@ -549,8 +691,8 @@ class CKPackAtlas:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "ck_frames": ("CK_FRAMES",),
                 "edited_frames": ("IMAGE",),
+                "ck_frames": ("CK_FRAMES",),
             },
             "optional": {
                 "save_to_output": ("BOOLEAN", {"default": True}),
@@ -582,14 +724,17 @@ class CKPackAtlas:
 
     def pack(
         self,
-        ck_frames,
         edited_frames,
+        ck_frames,
         save_to_output=True,
         filename_prefix="CustomKnight/atlas",
         external_directory="",
         override_width=0,
         override_height=0,
     ):
+        if isinstance(edited_frames, dict) and hasattr(ck_frames, "shape"):
+            edited_frames, ck_frames = ck_frames, edited_frames
+
         project = SpriteProject.from_root_folders(ck_frames["root_folders"])
         sprites = [Sprite.from_dict(d) for d in ck_frames["sprites"]]
 

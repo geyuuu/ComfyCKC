@@ -112,10 +112,12 @@ frames by collection and writes **one atlas PNG per collection** — saved as
 batch, and `saved_path` lists every written path (newline-separated).
 
 ### CK Merge Edits
-Combine two edited animations from the **same** collection into one
-`frames` + `ck_frames` pair so they pack into a single atlas. RGBA transparency
-stays inside `frames`; there are no separate alpha inputs or output. Chain
-several of these to edit many animations at once.
+Combine two or more edited animations into one `frames` + `ck_frames` pair so
+they pack together. Use **Add edit pair** on the node to append as many extra
+`frames_N` + `ck_frames_N` inputs as needed. RGBA transparency stays inside
+`frames`; there are no separate alpha inputs or output. If the inputs span
+several collections from the same project, the packer writes one atlas per
+collection.
 
 ### CK Project Info
 Inspect a dump: prints the base path, every collection (with computed atlas

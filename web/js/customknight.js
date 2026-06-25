@@ -19,7 +19,8 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 const PLACEHOLDER = "<refresh>";
-const NODE_NAME = "CKAnimationSelector";
+const SELECTOR_NODE_NAME = "CKAnimationSelector";
+const MERGE_NODE_NAME = "CKMergeEdits";
 
 // Preview box height as a fraction of its width. Keeping this constant means
 // the preview area's aspect ratio stays fixed when the node is resized.
@@ -83,18 +84,55 @@ function checkerPattern(ctx) {
 }
 
 app.registerExtension({
-  name: "CustomKnight.AnimationSelector",
+  name: "CustomKnight.Nodes",
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData.name !== NODE_NAME) return;
+    if (nodeData.name === SELECTOR_NODE_NAME) {
+      const onNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        onNodeCreated?.apply(this, arguments);
+        setupSelectorNode(this);
+      };
+    }
 
-    const onNodeCreated = nodeType.prototype.onNodeCreated;
-    nodeType.prototype.onNodeCreated = function () {
-      onNodeCreated?.apply(this, arguments);
-      setupSelectorNode(this);
-    };
+    if (nodeData.name === MERGE_NODE_NAME) {
+      const onNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        onNodeCreated?.apply(this, arguments);
+        setupMergeNode(this);
+      };
+    }
   },
 });
+
+function setupMergeNode(node) {
+  if (node._ckMergeControlsReady) return;
+  node._ckMergeControlsReady = true;
+  node.addWidget("button", "Add edit pair", null, () => addMergeEditPair(node), {
+    serialize: false,
+  });
+}
+
+function addMergeEditPair(node) {
+  const index = nextMergePairIndex(node);
+  node.addInput(`frames_${index}`, "IMAGE");
+  node.addInput(`ck_frames_${index}`, "CK_FRAMES");
+
+  if (node.computeSize && node.setSize) {
+    const [width, height] = node.computeSize();
+    node.setSize([Math.max(node.size?.[0] ?? width, width), height]);
+  }
+  app.graph?.setDirtyCanvas(true, true);
+}
+
+function nextMergePairIndex(node) {
+  let maxIndex = 2;
+  for (const input of node.inputs || []) {
+    const match = /^(?:ck_frames|frames|images)_(\d+)$/.exec(input.name || "");
+    if (match) maxIndex = Math.max(maxIndex, Number(match[1]));
+  }
+  return maxIndex + 1;
+}
 
 function setupSelectorNode(node) {
   const rootWidget = findWidget(node, "root_folders");
