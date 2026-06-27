@@ -20,6 +20,7 @@ import { api } from "../../scripts/api.js";
 
 const PLACEHOLDER = "<refresh>";
 const SELECTOR_NODE_NAME = "CKAnimationSelector";
+const FRAMES_PREVIEW_NODE_NAME = "CKFramesPreview";
 const MERGE_NODE_NAME = "CKMergeEdits";
 
 // Preview box height as a fraction of its width. Keeping this constant means
@@ -42,6 +43,15 @@ function imageURL(rootFolders, relPath) {
     path: relPath,
   }).toString();
   return api.apiURL(`/customknight/image?${qs}`);
+}
+
+function viewURL(image) {
+  const qs = new URLSearchParams({
+    filename: image.filename,
+    subfolder: image.subfolder || "",
+    type: image.type || "temp",
+  }).toString();
+  return api.apiURL(`/view?${qs}`);
 }
 
 function findWidget(node, name) {
@@ -95,6 +105,20 @@ app.registerExtension({
       };
     }
 
+    if (nodeData.name === FRAMES_PREVIEW_NODE_NAME) {
+      const onNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        onNodeCreated?.apply(this, arguments);
+        setupFramesPreviewNode(this);
+      };
+
+      const onExecuted = nodeType.prototype.onExecuted;
+      nodeType.prototype.onExecuted = function (message) {
+        onExecuted?.apply(this, arguments);
+        setExecutedPreviewFrames(this, message);
+      };
+    }
+
     if (nodeData.name === MERGE_NODE_NAME) {
       const onNodeCreated = nodeType.prototype.onNodeCreated;
       nodeType.prototype.onNodeCreated = function () {
@@ -134,19 +158,24 @@ function nextMergePairIndex(node) {
   return maxIndex + 1;
 }
 
-function setupSelectorNode(node) {
-  const rootWidget = findWidget(node, "root_folders");
-  const collectionWidget = findWidget(node, "collection");
-  const animationWidget = findWidget(node, "animation");
-
-  node._ckPreview = {
+function defaultPreviewState(emptyText = "no animation selected") {
+  return {
     frames: [],
     images: [],
     index: 0,
     playing: true,
     fps: 12,
     timer: null,
+    emptyText,
   };
+}
+
+function setupSelectorNode(node) {
+  const rootWidget = findWidget(node, "root_folders");
+  const collectionWidget = findWidget(node, "collection");
+  const animationWidget = findWidget(node, "animation");
+
+  node._ckPreview = defaultPreviewState();
 
   // --- control widgets -----------------------------------------------------
   node.addWidget("button", "Refresh", null, () => reloadCollections(node), {
@@ -215,6 +244,49 @@ function setupSelectorNode(node) {
     node.setDirtyCanvas(true, true);
     renderPreview(node); // draw the placeholder before any frames load
     if (rootWidget?.value?.trim()) reloadCollections(node);
+  }, 100);
+}
+
+function setupFramesPreviewNode(node) {
+  if (node._ckFramesPreviewReady) return;
+  node._ckFramesPreviewReady = true;
+  node._ckPreview = defaultPreviewState("no frames preview");
+
+  const playWidget = node.addWidget(
+    "toggle",
+    "play",
+    true,
+    (v) => {
+      node._ckPreview.playing = v;
+    },
+    { on: "playing", off: "paused", serialize: false }
+  );
+
+  node.addWidget(
+    "slider",
+    "frame",
+    0,
+    (v) => {
+      const p = node._ckPreview;
+      if (p.images.length) {
+        p.index = Math.max(0, Math.min(p.images.length - 1, Math.round(v)));
+        p.playing = false;
+        playWidget.value = false;
+        renderPreview(node);
+      }
+    },
+    { min: 0, max: 0, step: 1, precision: 0, serialize: false }
+  );
+  node._ckFrameWidget = findWidget(node, "frame");
+
+  addPreviewWidget(node);
+  startPreviewLoop(node);
+
+  setTimeout(() => {
+    const size = node.computeSize();
+    node.setSize([Math.max(node.size[0], size[0]), size[1]]);
+    node.setDirtyCanvas(true, true);
+    renderPreview(node);
   }, 100);
 }
 
@@ -395,13 +467,27 @@ async function reloadFrames(node) {
 
 /** Load `frames` (path/name/w/h list) into the preview and reset the scrubber. */
 function setFrames(node, frames, root) {
+  setPreviewImages(node, frames, (f) => imageURL(root, f.path));
+}
+
+function setExecutedPreviewFrames(node, message) {
+  const images = message?.images || message?.ui?.images || [];
+  const frames = images.map((image, index) => ({
+    ...image,
+    name: image.name || image.filename || `frame ${index + 1}`,
+  }));
+  setPreviewImages(node, frames, viewURL);
+}
+
+function setPreviewImages(node, frames, makeURL) {
+  if (!node._ckPreview) node._ckPreview = defaultPreviewState("no frames preview");
   const p = node._ckPreview;
   p.frames = frames || [];
   p.index = 0;
   p.images = p.frames.map((f) => {
     const img = new Image();
     img.onload = () => renderPreview(node);
-    img.src = imageURL(root, f.path);
+    img.src = makeURL(f);
     return img;
   });
   if (node._ckFrameWidget) {
@@ -464,7 +550,7 @@ function drawPreviewInto(ctx, node, w, h) {
     ctx.font = "13px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("no animation selected", w / 2, h / 2);
+    ctx.fillText(p.emptyText || "no animation selected", w / 2, h / 2);
     return;
   }
 

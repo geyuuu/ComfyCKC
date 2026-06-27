@@ -24,6 +24,7 @@ import json
 import math
 import os
 import random
+import tempfile
 
 import numpy as np
 import torch
@@ -100,6 +101,33 @@ def stack_frames(frames: list[Image.Image]) -> tuple[torch.Tensor, int, int]:
         imgs.append(pil_rgba_to_tensor(canvas))
 
     return torch.cat(imgs, 0), max_w, max_h
+
+
+def _temp_preview_directory() -> str:
+    if folder_paths is not None:
+        return folder_paths.get_temp_directory()
+    return tempfile.gettempdir()
+
+
+def _write_temp_preview_frames(frames: torch.Tensor, prefix: str) -> list[dict]:
+    _validate_alignment_image_batch("frames", frames)
+    temp_dir = _temp_preview_directory()
+    os.makedirs(temp_dir, exist_ok=True)
+
+    rand = random.randint(0, 0xFFFFFFFF)
+    results = []
+    for index, frame in enumerate(frames):
+        filename = f"{prefix}_{rand:08x}_{index:05d}.png"
+        tensor_to_pil_rgba(frame).save(os.path.join(temp_dir, filename))
+        results.append(
+            {
+                "filename": filename,
+                "subfolder": "",
+                "type": "temp",
+                "name": f"frame {index + 1}",
+            }
+        )
+    return results
 
 
 def _validate_alignment_image_batch(name: str, image: torch.Tensor) -> None:
@@ -493,6 +521,33 @@ class CKAnimationSelector:
             "sprites": [s.to_dict() for s in sprites],
         }
         return (images, ck_frames)
+
+
+class CKFramesPreview:
+    """Preview an IMAGE batch with the same animated canvas as the selector."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "frames": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("frames",)
+    FUNCTION = "preview"
+    CATEGORY = CATEGORY
+    OUTPUT_NODE = True
+    DESCRIPTION = (
+        "Preview a frames IMAGE batch using the same animated in-node preview "
+        "style as CK Animation Selector. The frames are passed through "
+        "unchanged."
+    )
+
+    def preview(self, frames):
+        images = _write_temp_preview_frames(frames, "ckframes_preview")
+        return {"ui": {"images": images, "animated": (True,)}, "result": (frames,)}
 
 
 # ---------------------------------------------------------------------------
@@ -1722,6 +1777,7 @@ class CKLoadProjectInfo:
 
 NODE_CLASS_MAPPINGS = {
     "CKAnimationSelector": CKAnimationSelector,
+    "CKFramesPreview": CKFramesPreview,
     "CKFramesToSheet": CKFramesToSheet,
     "CKSheetToFrames": CKSheetToFrames,
     "CKAutoAlignSheetStretch": CKAutoAlignSheetStretch,
@@ -1737,6 +1793,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CKAnimationSelector": "CK Animation Selector",
+    "CKFramesPreview": "CK Frames Preview",
     "CKFramesToSheet": "CK Frames to Sheet",
     "CKSheetToFrames": "CK Sheet to Frames",
     "CKAutoAlignSheetStretch": "CK Auto Align Sheet Stretch",

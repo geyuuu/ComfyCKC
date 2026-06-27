@@ -65,6 +65,9 @@ def test_selector_then_pack_roundtrip(tmp_path):
 def test_alpha_is_integrated_into_image_ports():
     assert nodes.CKAnimationSelector.RETURN_TYPES == ("IMAGE", "CK_FRAMES")
     assert nodes.CKAnimationSelector.RETURN_NAMES == ("frames", "ck_frames")
+    assert nodes.CKFramesPreview.RETURN_TYPES == ("IMAGE",)
+    assert nodes.CKFramesPreview.RETURN_NAMES == ("frames",)
+    assert nodes.CKFramesPreview.OUTPUT_NODE is True
 
     merge_inputs = nodes.CKMergeEdits.INPUT_TYPES()
     assert list(merge_inputs["required"]) == [
@@ -85,6 +88,7 @@ def test_alpha_is_integrated_into_image_ports():
         nodes.NODE_DISPLAY_NAME_MAPPINGS["CKManualAlignSheetStretch"]
         == "CK Manual Align Sheet Stretch"
     )
+    assert nodes.NODE_DISPLAY_NAME_MAPPINGS["CKFramesPreview"] == "CK Frames Preview"
 
     pack_inputs = nodes.CKPackAtlas.INPUT_TYPES()
     assert list(pack_inputs["required"]) == ["edited_frames", "ck_frames"]
@@ -95,6 +99,28 @@ def test_alpha_is_integrated_into_image_ports():
     save_frames_inputs = nodes.CKSaveFrames.INPUT_TYPES()
     assert "ck_frames" not in save_frames_inputs["required"]
     assert save_frames_inputs["optional"]["ck_frames"] == ("CK_FRAMES",)
+
+
+def test_frames_preview_passes_through_and_emits_temp_images(tmp_path, monkeypatch):
+    class FakeFolderPaths:
+        @staticmethod
+        def get_temp_directory():
+            return str(tmp_path)
+
+    monkeypatch.setattr(nodes, "folder_paths", FakeFolderPaths)
+    frames = nodes.torch.zeros((2, 3, 4, 4))
+    frames[..., 3] = 1
+
+    out = nodes.CKFramesPreview().preview(frames)
+
+    assert out["result"] == (frames,)
+    images = out["ui"]["images"]
+    assert len(images) == 2
+    assert images[0]["type"] == "temp"
+    assert images[0]["subfolder"] == ""
+    assert images[0]["name"] == "frame 1"
+    assert (tmp_path / images[0]["filename"]).is_file()
+    assert (tmp_path / images[1]["filename"]).is_file()
 
 
 def test_merge_edits_preserves_rgba_and_transparent_padding():
