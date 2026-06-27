@@ -84,6 +84,9 @@ def test_alpha_is_integrated_into_image_ports():
 
     assert nodes.CKSaveFramesDescriptor.RETURN_NAMES == ("ck_frames", "saved_path")
     assert nodes.CKLoadFramesDescriptor.RETURN_NAMES == ("ck_frames", "loaded_path")
+    save_frames_inputs = nodes.CKSaveFrames.INPUT_TYPES()
+    assert "ck_frames" not in save_frames_inputs["required"]
+    assert save_frames_inputs["optional"]["ck_frames"] == ("CK_FRAMES",)
 
 
 def test_merge_edits_preserves_rgba_and_transparent_padding():
@@ -190,6 +193,46 @@ def test_ck_frames_descriptor_save_load_roundtrip(tmp_path):
     assert loaded_descriptor == ck_frames
     assert saved_path == str(path.resolve())
     assert loaded_path == str(path.resolve())
+
+
+def test_save_load_frames_with_optional_descriptor_roundtrip(tmp_path):
+    root = _make_dump(tmp_path)
+    frames, ck_frames = nodes.CKAnimationSelector().select(root, "Knight", "Walk")
+    parent = tmp_path / "saved"
+
+    saved_frames, saved_descriptor, saved_path = nodes.CKSaveFrames().save(
+        frames, str(parent), ck_frames=ck_frames
+    )
+    loaded_frames, loaded_descriptor, loaded_path = nodes.CKLoadFrames().load(saved_path)
+
+    assert saved_path == str((parent / "Walk").resolve())
+    assert loaded_path == saved_path
+    assert (parent / "Walk" / "ck_frames.json").is_file()
+    assert (parent / "Walk" / "0.png").is_file()
+    assert (parent / "Walk" / "1.png").is_file()
+    assert not (parent / "Walk" / "frame_00000.png").exists()
+    assert nodes.torch.equal(saved_frames, frames)
+    assert nodes.torch.equal(loaded_frames, frames)
+    assert saved_descriptor == ck_frames
+    assert loaded_descriptor == ck_frames
+
+
+def test_save_load_frames_without_descriptor(tmp_path):
+    frames = nodes.torch.zeros((2, 3, 4, 4), dtype=nodes.torch.float32)
+    frames[1, ..., 3] = 1.0
+    parent = tmp_path / "saved"
+
+    _saved_frames, saved_descriptor, saved_path = nodes.CKSaveFrames().save(
+        frames, str(parent)
+    )
+    loaded_frames, loaded_descriptor, loaded_path = nodes.CKLoadFrames().load(saved_path)
+
+    assert saved_path == str((parent / "frames").resolve())
+    assert loaded_path == saved_path
+    assert saved_descriptor is None
+    assert loaded_descriptor is None
+    assert not (parent / "frames" / "ck_frames.json").exists()
+    assert nodes.torch.equal(loaded_frames, frames)
 
 
 def test_selector_frames_sheet_roundtrip_is_exact(tmp_path):

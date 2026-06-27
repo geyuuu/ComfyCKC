@@ -126,6 +126,14 @@ not the image pixels, so save the edited `frames` separately if you need a full
 disk round-trip. The original CustomKnight dump path still needs to exist when
 packing, because `CK Pack Atlas` reads unchanged sprites from disk.
 
+### CK Save / Load Frames
+Save an `IMAGE` frame batch as PNGs and load it back later. `CK Save Frames`
+takes `frames`, a parent `path`, and optional `ck_frames`. When `ck_frames` is
+connected, the node creates a subfolder named after the original animation and
+writes each frame with its original file name (`0.png`, `1.png`, etc.) plus
+`ck_frames.json`; without `ck_frames`, it uses a `frames` subfolder and saves a
+numbered PNG sequence.
+
 ### CK Project Info
 Inspect a dump: prints the base path, every collection (with computed atlas
 size) and its animations / frame counts. Handy for finding the right names.

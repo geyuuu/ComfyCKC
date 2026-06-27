@@ -961,6 +961,184 @@ def _validate_ck_frames_descriptor(value):
         raise ValueError("CK_FRAMES descriptor field 'sprites' must be a list.")
 
 
+class CKSaveFrames:
+    """Save IMAGE frames and, optionally, their CK_FRAMES descriptor."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "frames": ("IMAGE",),
+                "path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Parent folder. With ck_frames, an animation-named subfolder is created.",
+                    },
+                ),
+            },
+            "optional": {
+                "ck_frames": ("CK_FRAMES",),
+                "overwrite": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "CK_FRAMES", "STRING")
+    RETURN_NAMES = ("frames", "ck_frames", "saved_path")
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+    CATEGORY = CATEGORY
+    DESCRIPTION = "Save frames and optional ck_frames together under one folder."
+
+    def save(self, frames, path: str, ck_frames=None, overwrite=True):
+        _validate_image_batch(frames)
+        if ck_frames is not None:
+            _validate_frames_for_descriptor(frames, ck_frames)
+
+        base = _resolve_directory_path(path, "CK Save Frames path cannot be empty.")
+        folder = os.path.join(base, _animation_folder_name(ck_frames))
+        if os.path.exists(folder) and not overwrite:
+            raise FileExistsError(f"CK frames folder already exists: {folder}")
+        os.makedirs(folder, exist_ok=True)
+
+        frame_names = _saved_frame_file_names(frames.shape[0], ck_frames)
+        for index, frame_name in enumerate(frame_names):
+            tensor_to_pil_rgba(frames[index]).save(
+                os.path.join(folder, frame_name)
+            )
+
+        if ck_frames is not None:
+            with open(os.path.join(folder, "ck_frames.json"), "w", encoding="utf-8") as fh:
+                json.dump(ck_frames, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+
+        return (frames, ck_frames, folder)
+
+
+class CKLoadFrames:
+    """Load IMAGE frames and an optional CK_FRAMES descriptor from a folder."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Folder written by CK Save Frames, or its ck_frames.json file.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "CK_FRAMES", "STRING")
+    RETURN_NAMES = ("frames", "ck_frames", "loaded_path")
+    FUNCTION = "load"
+    CATEGORY = CATEGORY
+    DESCRIPTION = "Load frames and optional ck_frames saved by CK Save Frames."
+
+    def load(self, path: str):
+        folder = _resolve_saved_frames_directory(path)
+        descriptor_path = os.path.join(folder, "ck_frames.json")
+        ck_frames = None
+        if os.path.isfile(descriptor_path):
+            with open(descriptor_path, "r", encoding="utf-8") as fh:
+                ck_frames = json.load(fh)
+            _validate_ck_frames_descriptor(ck_frames)
+
+        frame_paths = _saved_frame_paths(folder, ck_frames)
+        frames = [Image.open(frame_path).convert("RGBA") for frame_path in frame_paths]
+        images, _, _ = stack_frames(frames)
+        if ck_frames is not None:
+            _validate_frames_for_descriptor(images, ck_frames)
+        return (images, ck_frames, folder)
+
+
+def _validate_image_batch(frames):
+    if not hasattr(frames, "dim") or frames.dim() != 4:
+        raise ValueError("CK Save Frames expects an IMAGE batch shaped [frames, height, width, channels].")
+    if frames.shape[0] <= 0:
+        raise ValueError("CK Save Frames received no frames.")
+
+
+def _validate_frames_for_descriptor(frames, ck_frames):
+    _validate_image_batch(frames)
+    _validate_ck_frames_descriptor(ck_frames)
+    if frames.shape[0] != len(ck_frames["sprites"]):
+        raise ValueError(
+            f"Frame count mismatch: ck_frames describes {len(ck_frames['sprites'])} "
+            f"sprite(s) but {frames.shape[0]} image(s) were supplied."
+        )
+
+
+def _resolve_directory_path(path: str, empty_message: str) -> str:
+    path = str(path or "").strip().strip('"')
+    if not path:
+        raise ValueError(empty_message)
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _resolve_saved_frames_directory(path: str) -> str:
+    resolved = _resolve_directory_path(path, "CK Load Frames path cannot be empty.")
+    if os.path.isfile(resolved):
+        if os.path.basename(resolved) != "ck_frames.json":
+            raise ValueError("CK Load Frames file path must point to ck_frames.json.")
+        return os.path.dirname(resolved)
+    if os.path.isdir(resolved):
+        return resolved
+    raise FileNotFoundError(f"CK Load Frames folder does not exist: {resolved}")
+
+
+def _animation_folder_name(ck_frames) -> str:
+    animation = "frames"
+    if ck_frames is not None:
+        animation = str(ck_frames.get("animation") or "frames")
+    cleaned = "".join(ch if ch.isalnum() or ch in " ._+-" else "_" for ch in animation)
+    return (cleaned.strip(" .") or "frames")[:120]
+
+
+def _frame_file_name(index: int) -> str:
+    return f"frame_{index:05}.png"
+
+
+def _saved_frame_file_names(frame_count: int, ck_frames):
+    if ck_frames is None:
+        return [_frame_file_name(index) for index in range(frame_count)]
+    names = [
+        os.path.basename(str(sprite.get("path", "")).replace("\\", "/"))
+        for sprite in ck_frames["sprites"]
+    ]
+    if any(not name for name in names):
+        raise ValueError("CK_FRAMES sprite path is missing a file name.")
+    if len(set(names)) != len(names):
+        raise ValueError(
+            "CK Save Frames cannot preserve original file names because "
+            "the descriptor contains duplicate file names."
+        )
+    return names
+
+
+def _saved_frame_paths(folder: str, ck_frames):
+    if ck_frames is not None:
+        paths = [
+            os.path.join(folder, name)
+            for name in _saved_frame_file_names(len(ck_frames["sprites"]), ck_frames)
+        ]
+    else:
+        paths = [
+            os.path.join(folder, name)
+            for name in sorted(os.listdir(folder))
+            if name.lower().endswith(".png") and name.startswith("frame_")
+        ]
+    if not paths:
+        raise FileNotFoundError(f"No saved frame PNGs found in: {folder}")
+    missing = [path for path in paths if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(f"Missing saved frame: {missing[0]}")
+    return paths
+
+
 # ---------------------------------------------------------------------------
 # CKLoadProjectInfo (inspection helper)
 # ---------------------------------------------------------------------------
@@ -1005,6 +1183,8 @@ NODE_CLASS_MAPPINGS = {
     "CKMergeEdits": CKMergeEdits,
     "CKSaveFramesDescriptor": CKSaveFramesDescriptor,
     "CKLoadFramesDescriptor": CKLoadFramesDescriptor,
+    "CKSaveFrames": CKSaveFrames,
+    "CKLoadFrames": CKLoadFrames,
     "CKLoadProjectInfo": CKLoadProjectInfo,
 }
 
@@ -1016,6 +1196,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CKMergeEdits": "CK Merge Edits",
     "CKSaveFramesDescriptor": "CK Save Frames Descriptor",
     "CKLoadFramesDescriptor": "CK Load Frames Descriptor",
+    "CKSaveFrames": "CK Save Frames",
+    "CKLoadFrames": "CK Load Frames",
     "CKLoadProjectInfo": "CK Project Info",
 }
 
