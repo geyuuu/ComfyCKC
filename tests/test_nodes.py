@@ -77,6 +77,14 @@ def test_alpha_is_integrated_into_image_ports():
     assert merge_inputs["optional"]["ck_frames_3"] == ("CK_FRAMES",)
     assert nodes.CKMergeEdits.RETURN_TYPES == ("CK_FRAMES", "IMAGE")
     assert nodes.CKMergeEdits.RETURN_NAMES == ("ck_frames", "frames")
+    assert (
+        nodes.NODE_DISPLAY_NAME_MAPPINGS["CKAutoAlignSheetStretch"]
+        == "CK Auto Align Sheet Stretch"
+    )
+    assert (
+        nodes.NODE_DISPLAY_NAME_MAPPINGS["CKManualAlignSheetStretch"]
+        == "CK Manual Align Sheet Stretch"
+    )
 
     pack_inputs = nodes.CKPackAtlas.INPUT_TYPES()
     assert list(pack_inputs["required"]) == ["edited_frames", "ck_frames"]
@@ -244,10 +252,15 @@ def test_selector_frames_sheet_roundtrip_is_exact(tmp_path):
     sheet, layout = nodes.CKFramesToSheet().combine(frames, columns=1)
     restored, = nodes.CKSheetToFrames().split(sheet, layout)
 
-    assert sheet.shape == (1, 1488, 448, 4)
+    assert sheet.shape == (1, 1152, 576, 4)
     assert sheet.shape[1] % 16 == 0
     assert sheet.shape[2] % 16 == 0
     assert 655_360 <= sheet.shape[1] * sheet.shape[2] <= 8_294_400
+    assert layout["version"] == 4
+    assert layout["padding_left"] == 16
+    assert layout["padding_top"] == 16
+    assert nodes.torch.count_nonzero(sheet[:, :16, :, :]) == 0
+    assert nodes.torch.count_nonzero(sheet[:, :, :16, :]) == 0
     assert restored.shape == frames.shape
     assert restored.dtype == frames.dtype
     assert restored.device == frames.device
@@ -262,32 +275,56 @@ def test_frames_sheet_auto_grid_and_roundtrip_are_exact():
     sheet, layout = nodes.CKFramesToSheet().combine(frames)
     restored, = nodes.CKSheetToFrames().split(sheet, layout)
 
-    assert sheet.shape == (1, 544, 1216, 4)
+    assert sheet.shape == (1, 736, 912, 4)
     assert layout == {
-        "version": 3,
+        "version": 4,
         "frame_count": 5,
         "frame_height": 2,
         "frame_width": 3,
         "channels": 4,
         "columns": 3,
         "rows": 2,
-        "sheet_height": 544,
-        "sheet_width": 1216,
+        "padding_left": 16,
+        "padding_top": 16,
+        "sheet_height": 736,
+        "sheet_width": 912,
     }
     assert nodes.torch.equal(restored, frames)
     # The unused final grid cell is transparent/black rather than duplicated.
-    assert nodes.torch.count_nonzero(sheet[:, 2:4, 6:9, :]) == 0
-    # Right/bottom alignment padding is transparent/black too.
-    assert nodes.torch.count_nonzero(sheet[:, 4:, :, :]) == 0
-    assert nodes.torch.count_nonzero(sheet[:, :, 9:, :]) == 0
+    assert nodes.torch.count_nonzero(sheet[:, 18:20, 22:25, :]) == 0
+    # Left/top gutters and right/bottom alignment padding are transparent/black too.
+    assert nodes.torch.count_nonzero(sheet[:, :16, :, :]) == 0
+    assert nodes.torch.count_nonzero(sheet[:, :, :16, :]) == 0
+    assert nodes.torch.count_nonzero(sheet[:, 20:, :, :]) == 0
+    assert nodes.torch.count_nonzero(sheet[:, :, 25:, :]) == 0
 
 
-def test_sheet_split_rejects_a_resized_sheet():
-    frames = nodes.torch.zeros((2, 4, 5, 3))
+def test_sheet_split_resizes_sheet_to_layout_before_slicing():
+    frames = nodes.torch.zeros((2, 4, 5, 3), dtype=nodes.torch.float32)
+    frames[0, :, :, 0] = 1.0
+    frames[1, :, :, 1] = 1.0
     sheet, layout = nodes.CKFramesToSheet().combine(frames)
 
-    with pytest.raises(ValueError, match="Sheet shape mismatch"):
-        nodes.CKSheetToFrames().split(sheet[:, :-1], layout)
+    resized_sheet = nodes.F.interpolate(
+        sheet.permute(0, 3, 1, 2),
+        size=(sheet.shape[1] // 2, sheet.shape[2] // 2),
+        mode="bilinear",
+        align_corners=False,
+    ).permute(0, 2, 3, 1)
+    restored, = nodes.CKSheetToFrames().split(resized_sheet, layout)
+
+    assert restored.shape == frames.shape
+    assert restored.dtype == nodes.torch.float32
+    assert nodes.torch.mean(restored[0, :, :, 0]) > 0.7
+    assert nodes.torch.mean(restored[1, :, :, 1]) > 0.7
+
+
+def test_sheet_split_rejects_channel_mismatch():
+    frames = nodes.torch.zeros((2, 4, 5, 4))
+    sheet, layout = nodes.CKFramesToSheet().combine(frames)
+
+    with pytest.raises(ValueError, match="Sheet channel mismatch"):
+        nodes.CKSheetToFrames().split(sheet[..., :3], layout)
 
 
 def test_frames_sheet_rejects_a_grid_above_custom_resolution_maximum():
@@ -295,6 +332,72 @@ def test_frames_sheet_rejects_a_grid_above_custom_resolution_maximum():
 
     with pytest.raises(ValueError, match="exceeding the 8,294,400 maximum"):
         nodes.CKFramesToSheet().combine(frames)
+
+
+def _synthetic_alignment_sheet():
+    sheet = nodes.torch.zeros((1, 96, 128, 4), dtype=nodes.torch.float32)
+    boxes = [
+        (8, 10, 12, 20, (1.0, 0.1, 0.1)),
+        (38, 14, 20, 10, (0.2, 0.9, 0.1)),
+        (82, 18, 14, 24, (0.1, 0.4, 1.0)),
+        (22, 54, 24, 16, (1.0, 0.8, 0.2)),
+        (76, 62, 34, 12, (0.9, 0.2, 0.8)),
+    ]
+    for x, y, width, height, colour in boxes:
+        sheet[:, y : y + height, x : x + width, :3] = nodes.torch.tensor(colour)
+        sheet[:, y : y + height, x : x + width, 3] = 1.0
+    return sheet
+
+
+def test_manual_sheet_stretch_alignment_outputs_reference_size_and_preview():
+    reference = _synthetic_alignment_sheet()
+    stretcher = nodes.CKManualAlignSheetStretch()
+    stretched, _preview = stretcher.adjust(
+        reference,
+        reference,
+        stretch_x=1 / 1.08,
+        stretch_y=1 / 1.05,
+    )
+
+    corrected, overlay = stretcher.adjust(
+        stretched,
+        reference,
+        stretch_x=1.08,
+        stretch_y=1.05,
+    )
+
+    baseline_error = nodes.torch.mean((stretched[..., 3] - reference[..., 3]) ** 2)
+    corrected_error = nodes.torch.mean((corrected[..., 3] - reference[..., 3]) ** 2)
+    assert corrected.shape == reference.shape
+    assert overlay.shape == (1, reference.shape[1], reference.shape[2], 4)
+    assert corrected_error < baseline_error * 0.75
+
+
+def test_auto_sheet_stretch_alignment_finds_top_left_scale():
+    reference = _synthetic_alignment_sheet()
+    stretched, _preview = nodes.CKManualAlignSheetStretch().adjust(
+        reference,
+        reference,
+        stretch_x=1 / 1.07,
+        stretch_y=1 / 1.04,
+    )
+
+    aligned, overlay, stretch_x, stretch_y, match_error = nodes.CKAutoAlignSheetStretch().align(
+        stretched,
+        reference,
+        search_percent=10.0,
+        coarse_steps=21,
+        fine_steps=9,
+    )
+
+    baseline_error = nodes.torch.mean((stretched[..., 3] - reference[..., 3]) ** 2)
+    aligned_error = nodes.torch.mean((aligned[..., 3] - reference[..., 3]) ** 2)
+    assert aligned.shape == reference.shape
+    assert overlay.shape == (1, reference.shape[1], reference.shape[2], 4)
+    assert abs(stretch_x - 1.07) < 0.025
+    assert abs(stretch_y - 1.04) < 0.025
+    assert match_error >= 0
+    assert aligned_error < baseline_error * 0.85
 
 
 def _make_numbered_dump(tmp_path):

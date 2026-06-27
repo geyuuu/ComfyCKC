@@ -1,0 +1,40 @@
+{
+  "root_folders": "D:\\SilkSong\\ComfyCKC\\.codex-pytest-tmp\\test_save_load_frames_with_opt0\\Skin\\Knight",
+  "basepath": "D:\\SilkSong\\ComfyCKC\\.codex-pytest-tmp\\test_save_load_frames_with_opt0\\Skin",
+  "mode": "single animation",
+  "collection": "Knight",
+  "collections": [
+    "Knight"
+  ],
+  "animation": "Walk",
+  "frame_size": [
+    12,
+    20
+  ],
+  "sprites": [
+    {
+      "id": "w0",
+      "x": 0,
+      "y": 0,
+      "xr": 0,
+      "yr": 0,
+      "w": 10,
+      "h": 20,
+      "flipped": false,
+      "path": "Knight/Walk/0.png",
+      "collection": "Knight"
+    },
+    {
+      "id": "w1",
+      "x": 16,
+      "y": 0,
+      "xr": 0,
+      "yr": 0,
+      "w": 12,
+      "h": 16,
+      "flipped": false,
+      "path": "Knight/Walk/1.png",
+      "collection": "Knight"
+    }
+  ]
+}

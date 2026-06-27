@@ -27,6 +27,7 @@ import random
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from .sprite_handler import (
@@ -99,6 +100,258 @@ def stack_frames(frames: list[Image.Image]) -> tuple[torch.Tensor, int, int]:
         imgs.append(pil_rgba_to_tensor(canvas))
 
     return torch.cat(imgs, 0), max_w, max_h
+
+
+def _validate_alignment_image_batch(name: str, image: torch.Tensor) -> None:
+    if not hasattr(image, "dim") or image.dim() != 4:
+        raise ValueError(
+            f"{name} must be an IMAGE batch shaped [batch, height, width, channels]."
+        )
+    if image.shape[0] < 1 or min(image.shape[1:]) < 1:
+        raise ValueError(f"{name} has an invalid empty shape.")
+
+
+def _paired_image_batches(
+    modified: torch.Tensor, reference: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _validate_alignment_image_batch("modified", modified)
+    _validate_alignment_image_batch("reference", reference)
+
+    modified_count = modified.shape[0]
+    reference_count = reference.shape[0]
+    if modified_count == reference_count:
+        return modified, reference
+    if modified_count == 1:
+        return modified.expand(reference_count, -1, -1, -1), reference
+    if reference_count == 1:
+        return modified, reference.expand(modified_count, -1, -1, -1)
+    raise ValueError(
+        "modified and reference batches must have the same batch size, or one "
+        "of them must contain exactly one image."
+    )
+
+
+def _normalised_axis(
+    length: int, source_length: int, stretch: float, device, dtype
+) -> torch.Tensor:
+    if length == 1 or source_length == 1:
+        return torch.zeros((length,), device=device, dtype=dtype)
+    base_scale = (source_length - 1) / (length - 1)
+    source_position = torch.arange(length, device=device, dtype=dtype)
+    source_position = source_position * base_scale * stretch
+    return source_position / (source_length - 1) * 2.0 - 1.0
+
+
+def _resample_top_left(
+    image: torch.Tensor,
+    height: int,
+    width: int,
+    stretch_x: float,
+    stretch_y: float,
+    resampling: str = "bilinear",
+    clamp_output: bool = True,
+) -> torch.Tensor:
+    if stretch_x <= 0 or stretch_y <= 0:
+        raise ValueError("stretch_x and stretch_y must be greater than 0.")
+    if resampling not in ("nearest", "bilinear", "bicubic"):
+        raise ValueError("resampling must be one of: nearest, bilinear, bicubic.")
+
+    _validate_alignment_image_batch("image", image)
+    source = image.permute(0, 3, 1, 2).contiguous().to(torch.float32)
+    batch, _channels, source_height, source_width = source.shape
+    grid_x = _normalised_axis(
+        width, source_width, float(stretch_x), source.device, source.dtype
+    )
+    grid_y = _normalised_axis(
+        height, source_height, float(stretch_y), source.device, source.dtype
+    )
+    yy, xx = torch.meshgrid(grid_y, grid_x, indexing="ij")
+    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).expand(batch, -1, -1, -1)
+    sampled = F.grid_sample(
+        source,
+        grid,
+        mode=resampling,
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    sampled = sampled.permute(0, 2, 3, 1)
+    if clamp_output:
+        sampled = sampled.clamp(0, 1)
+    return sampled
+
+
+def _single_channel_intensity(frame: torch.Tensor, prefer_alpha: bool) -> torch.Tensor:
+    frame = frame.to(torch.float32).clamp(0, 1)
+    if prefer_alpha and frame.shape[-1] >= 4:
+        alpha = frame[..., 3]
+        if alpha.max() > 0.001 and alpha.max() - alpha.min() > 0.01:
+            return alpha
+
+    if frame.shape[-1] >= 3:
+        return (
+            frame[..., 0] * 0.299
+            + frame[..., 1] * 0.587
+            + frame[..., 2] * 0.114
+        )
+    return frame[..., 0]
+
+
+def _edge_feature(frame: torch.Tensor) -> torch.Tensor:
+    base = _single_channel_intensity(frame, prefer_alpha=True)
+    dx = torch.zeros_like(base)
+    dy = torch.zeros_like(base)
+    dx[:, 1:] = (base[:, 1:] - base[:, :-1]).abs()
+    dy[1:, :] = (base[1:, :] - base[:-1, :]).abs()
+    feature = base * 0.25 + dx + dy
+    minimum = feature.min()
+    maximum = feature.max()
+    if maximum > minimum:
+        feature = (feature - minimum) / (maximum - minimum)
+    return feature
+
+
+def _match_feature(frame: torch.Tensor, max_size: int = 256) -> torch.Tensor:
+    feature = _edge_feature(frame)
+    height, width = feature.shape
+    scale = min(1.0, max_size / max(height, width))
+    target_height = max(2, int(round(height * scale)))
+    target_width = max(2, int(round(width * scale)))
+    if (target_height, target_width) != (height, width):
+        feature = F.interpolate(
+            feature[None, None, :, :],
+            size=(target_height, target_width),
+            mode="area",
+        )[0, 0]
+    feature = feature - feature.mean()
+    std = feature.std()
+    if std > 1e-6:
+        feature = feature / std
+    return feature
+
+
+def _score_stretch(
+    modified_feature: torch.Tensor,
+    reference_feature: torch.Tensor,
+    stretch_x: float,
+    stretch_y: float,
+) -> float:
+    sampled = _resample_top_left(
+        modified_feature[None, :, :, None],
+        reference_feature.shape[0],
+        reference_feature.shape[1],
+        stretch_x,
+        stretch_y,
+        "bilinear",
+        clamp_output=False,
+    )[0, :, :, 0]
+    return float(torch.mean((sampled - reference_feature) ** 2).item())
+
+
+def _odd_step_count(value: int) -> int:
+    value = max(3, int(value))
+    return value if value % 2 == 1 else value + 1
+
+
+def _estimate_top_left_stretch(
+    modified: torch.Tensor,
+    reference: torch.Tensor,
+    search_percent: float,
+    coarse_steps: int,
+    fine_steps: int,
+) -> tuple[float, float, float]:
+    search = max(0.0, float(search_percent)) / 100.0
+    min_scale = max(0.01, 1.0 - search)
+    max_scale = 1.0 + search
+    if search == 0:
+        score = _score_stretch(
+            _match_feature(modified),
+            _match_feature(reference),
+            1.0,
+            1.0,
+        )
+        return 1.0, 1.0, score
+
+    modified_feature = _match_feature(modified)
+    reference_feature = _match_feature(reference)
+
+    best_x = 1.0
+    best_y = 1.0
+    best_score = math.inf
+    coarse_steps = _odd_step_count(coarse_steps)
+    for x in torch.linspace(min_scale, max_scale, coarse_steps).tolist():
+        for y in torch.linspace(min_scale, max_scale, coarse_steps).tolist():
+            score = _score_stretch(modified_feature, reference_feature, x, y)
+            if score < best_score:
+                best_x = float(x)
+                best_y = float(y)
+                best_score = score
+
+    coarse_step = (max_scale - min_scale) / max(1, coarse_steps - 1)
+    fine_half_span = coarse_step * 2.0
+    fine_steps = _odd_step_count(fine_steps)
+    fine_min_x = max(min_scale, best_x - fine_half_span)
+    fine_max_x = min(max_scale, best_x + fine_half_span)
+    fine_min_y = max(min_scale, best_y - fine_half_span)
+    fine_max_y = min(max_scale, best_y + fine_half_span)
+    for x in torch.linspace(fine_min_x, fine_max_x, fine_steps).tolist():
+        for y in torch.linspace(fine_min_y, fine_max_y, fine_steps).tolist():
+            score = _score_stretch(modified_feature, reference_feature, x, y)
+            if score < best_score:
+                best_x = float(x)
+                best_y = float(y)
+                best_score = score
+
+    return best_x, best_y, best_score
+
+
+def _rgb_for_preview(frame: torch.Tensor) -> torch.Tensor:
+    frame = frame.to(torch.float32).clamp(0, 1)
+    if frame.shape[-1] >= 3:
+        rgb = frame[..., :3]
+    else:
+        rgb = frame[..., :1].expand(-1, -1, 3)
+    if frame.shape[-1] >= 4:
+        rgb = rgb * frame[..., 3:4]
+    return rgb
+
+
+def _overlay_intensity(frame: torch.Tensor) -> torch.Tensor:
+    intensity = _single_channel_intensity(frame, prefer_alpha=True)
+    maximum = intensity.max()
+    if maximum > 1e-6:
+        intensity = intensity / maximum
+    return intensity.clamp(0, 1)
+
+
+def _overlay_preview(
+    adjusted: torch.Tensor,
+    reference: torch.Tensor,
+    preview_mode: str,
+    preview_opacity: float,
+) -> torch.Tensor:
+    opacity = max(0.0, min(1.0, float(preview_opacity)))
+    previews: list[torch.Tensor] = []
+    for index in range(adjusted.shape[0]):
+        adj = adjusted[index]
+        ref = reference[index]
+        if preview_mode == "blend":
+            rgb = _rgb_for_preview(ref) * (1.0 - opacity) + _rgb_for_preview(adj) * opacity
+        elif preview_mode == "difference":
+            rgb = (_rgb_for_preview(adj) - _rgb_for_preview(ref)).abs()
+        else:
+            ref_i = _overlay_intensity(ref)
+            adj_i = _overlay_intensity(adj)
+            rgb = torch.stack(
+                (
+                    ref_i,
+                    adj_i,
+                    (ref_i - adj_i).abs() * 0.35,
+                ),
+                dim=-1,
+            )
+        alpha = torch.ones((*rgb.shape[:2], 1), dtype=rgb.dtype, device=rgb.device)
+        previews.append(torch.cat((rgb.clamp(0, 1), alpha), dim=-1)[None, ...])
+    return torch.cat(previews, dim=0)
 
 
 def _project_from(root_folders: str) -> SpriteProject:
@@ -246,6 +499,7 @@ class CKAnimationSelector:
 # Reversible frame-sheet helpers
 # ---------------------------------------------------------------------------
 _SHEET_ALIGNMENT = 16
+_SHEET_CONTENT_PADDING = 16
 _SHEET_MIN_PIXELS = 655_360
 _SHEET_MAX_PIXELS = 8_294_400
 
@@ -348,29 +602,33 @@ class CKFramesToSheet:
             columns = math.ceil(math.sqrt(frame_count))
         columns = min(columns, frame_count)
         rows = math.ceil(frame_count / columns)
-        content_height = rows * frame_height
-        content_width = columns * frame_width
+        padding_left = _SHEET_CONTENT_PADDING
+        padding_top = _SHEET_CONTENT_PADDING
+        content_height = padding_top + rows * frame_height
+        content_width = padding_left + columns * frame_width
         sheet_width, sheet_height = _frame_sheet_size(content_width, content_height)
 
         # new_zeros retains the input tensor's dtype and device. Direct slice
         # assignment performs no resize, colour conversion, or quantisation.
-        # Alignment padding is added only to the right and bottom, outside all
-        # frame cells, so it can never become part of a restored frame.
+        # The frame grid starts after a fixed left/top transparent gutter, and
+        # any remaining alignment padding stays outside all frame cells.
         sheet = frames.new_zeros((1, sheet_height, sheet_width, channels))
         for index in range(frame_count):
             row, column = divmod(index, columns)
-            y = row * frame_height
-            x = column * frame_width
+            y = padding_top + row * frame_height
+            x = padding_left + column * frame_width
             sheet[0, y : y + frame_height, x : x + frame_width, :] = frames[index]
 
         layout = {
-            "version": 3,
+            "version": 4,
             "frame_count": frame_count,
             "frame_height": frame_height,
             "frame_width": frame_width,
             "channels": channels,
             "columns": columns,
             "rows": rows,
+            "padding_left": padding_left,
+            "padding_top": padding_top,
             "sheet_height": sheet_height,
             "sheet_width": sheet_width,
         }
@@ -386,6 +644,16 @@ class CKSheetToFrames:
             "required": {
                 "sheet": ("IMAGE",),
                 "sheet_layout": ("CK_FRAME_SHEET",),
+                "resize_method": (
+                    ["bilinear", "bicubic", "nearest"],
+                    {
+                        "default": "bilinear",
+                        "tooltip": (
+                            "How to resize the input sheet if its width/height "
+                            "does not match sheet_layout."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -395,15 +663,23 @@ class CKSheetToFrames:
     CATEGORY = CATEGORY
     DESCRIPTION = (
         "Split an image made by CK Frames to Sheet back into its original "
-        "ordered IMAGE batch, with identical frame dimensions and values."
+        "ordered IMAGE batch. If the sheet was resized, it is resized back to "
+        "the dimensions recorded in sheet_layout before slicing."
     )
 
-    def split(self, sheet: torch.Tensor, sheet_layout):
+    def split(
+        self,
+        sheet: torch.Tensor,
+        sheet_layout,
+        resize_method: str = "bilinear",
+    ):
         if sheet.dim() != 4 or sheet.shape[0] != 1:
             raise ValueError("CK Sheet to Frames expects exactly one sheet image.")
+        if resize_method not in ("bilinear", "bicubic", "nearest"):
+            raise ValueError("resize_method must be one of: bilinear, bicubic, nearest.")
         if (
             not isinstance(sheet_layout, dict)
-            or sheet_layout.get("version") not in (1, 2, 3)
+            or sheet_layout.get("version") not in (1, 2, 3, 4)
         ):
             raise ValueError("CK Sheet to Frames received an unsupported sheet layout.")
 
@@ -424,7 +700,21 @@ class CKSheetToFrames:
 
         if min(frame_count, frame_height, frame_width, channels, columns, rows) < 1:
             raise ValueError("CK Sheet to Frames received an invalid sheet layout.")
-        if sheet_layout["version"] in (2, 3):
+        if sheet_layout["version"] >= 4:
+            try:
+                padding_left = int(sheet_layout["padding_left"])
+                padding_top = int(sheet_layout["padding_top"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "CK Sheet to Frames received an invalid sheet layout."
+                ) from exc
+            if padding_left < 0 or padding_top < 0:
+                raise ValueError("CK Sheet to Frames received an invalid sheet layout.")
+        else:
+            padding_left = 0
+            padding_top = 0
+
+        if sheet_layout["version"] in (2, 3, 4):
             try:
                 sheet_height = int(sheet_layout["sheet_height"])
                 sheet_width = int(sheet_layout["sheet_width"])
@@ -432,11 +722,11 @@ class CKSheetToFrames:
                 raise ValueError(
                     "CK Sheet to Frames received an invalid sheet layout."
                 ) from exc
-            content_height = rows * frame_height
-            content_width = columns * frame_width
+            content_height = padding_top + rows * frame_height
+            content_width = padding_left + columns * frame_width
             if sheet_layout["version"] == 2:
-                expected_height = ((content_height + 15) // 16) * 16
-                expected_width = ((content_width + 15) // 16) * 16
+                expected_height = ((rows * frame_height + 15) // 16) * 16
+                expected_width = ((columns * frame_width + 15) // 16) * 16
                 valid_size = (sheet_height, sheet_width) == (
                     expected_height,
                     expected_width,
@@ -458,28 +748,283 @@ class CKSheetToFrames:
             sheet_height = rows * frame_height
             sheet_width = columns * frame_width
 
-        content_height = rows * frame_height
-        content_width = columns * frame_width
+        content_height = padding_top + rows * frame_height
+        content_width = padding_left + columns * frame_width
         if sheet_height < content_height or sheet_width < content_width:
             raise ValueError("CK Sheet to Frames received an invalid sheet layout.")
 
         expected_shape = (sheet_height, sheet_width, channels)
-        if tuple(sheet.shape[1:]) != expected_shape:
+        if int(sheet.shape[3]) != channels:
             raise ValueError(
-                "Sheet shape mismatch: layout expects "
-                f"[1, {expected_shape[0]}, {expected_shape[1]}, {expected_shape[2]}] "
-                f"but received {list(sheet.shape)}. Was the sheet resized or cropped?"
+                "Sheet channel mismatch: layout expects "
+                f"{channels} channels but received {int(sheet.shape[3])}."
             )
+        if tuple(sheet.shape[1:3]) != (sheet_height, sheet_width):
+            source = sheet.permute(0, 3, 1, 2).contiguous().to(torch.float32)
+            kwargs = {}
+            if resize_method != "nearest":
+                kwargs["align_corners"] = False
+            sheet = F.interpolate(
+                source,
+                size=(sheet_height, sheet_width),
+                mode=resize_method,
+                **kwargs,
+            ).permute(0, 2, 3, 1).clamp(0, 1)
         if frame_count > rows * columns:
             raise ValueError("CK Sheet to Frames layout has more frames than grid cells.")
 
         frames: list[torch.Tensor] = []
         for index in range(frame_count):
             row, column = divmod(index, columns)
-            y = row * frame_height
-            x = column * frame_width
+            y = padding_top + row * frame_height
+            x = padding_left + column * frame_width
             frames.append(sheet[:, y : y + frame_height, x : x + frame_width, :])
         return (torch.cat(frames, dim=0),)
+
+
+# ---------------------------------------------------------------------------
+# CK sheet stretch alignment helpers
+# ---------------------------------------------------------------------------
+class CKAutoAlignSheetStretch:
+    """Automatically undo a small top-left anchored sheet stretch."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "modified": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "search_percent": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 50.0,
+                        "step": 0.1,
+                        "tooltip": (
+                            "Maximum stretch correction to search around 1.0, "
+                            "as a percent. 8 searches 0.92-1.08."
+                        ),
+                    },
+                ),
+                "coarse_steps": (
+                    "INT",
+                    {
+                        "default": 25,
+                        "min": 3,
+                        "max": 101,
+                        "tooltip": (
+                            "Number of coarse samples per axis; even values "
+                            "are rounded up."
+                        ),
+                    },
+                ),
+                "fine_steps": (
+                    "INT",
+                    {
+                        "default": 11,
+                        "min": 3,
+                        "max": 101,
+                        "tooltip": "Number of fine samples per axis around the best coarse match.",
+                    },
+                ),
+                "resampling": (
+                    ["bilinear", "bicubic", "nearest"],
+                    {
+                        "default": "bilinear",
+                        "tooltip": "Interpolation used for the corrected output image.",
+                    },
+                ),
+                "preview_mode": (
+                    ["red/green overlap", "blend", "difference"],
+                    {
+                        "default": "red/green overlap",
+                        "tooltip": (
+                            "Preview style. Red/green shows reference in red, "
+                            "corrected image in green, and yellow where they overlap."
+                        ),
+                    },
+                ),
+                "preview_opacity": (
+                    "FLOAT",
+                    {
+                        "default": 0.5,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Opacity of the corrected image in blend preview mode.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "FLOAT", "FLOAT", "FLOAT")
+    RETURN_NAMES = (
+        "aligned",
+        "overlay_preview",
+        "stretch_x",
+        "stretch_y",
+        "match_error",
+    )
+    FUNCTION = "align"
+    CATEGORY = CATEGORY
+    DESCRIPTION = (
+        "Correct a modified spritesheet that has a small stretch relative to a "
+        "reference sheet, using the top-left corner as the fixed origin. The "
+        "aligned output always uses the reference resolution."
+    )
+
+    def align(
+        self,
+        modified: torch.Tensor,
+        reference: torch.Tensor,
+        search_percent: float = 8.0,
+        coarse_steps: int = 25,
+        fine_steps: int = 11,
+        resampling: str = "bilinear",
+        preview_mode: str = "red/green overlap",
+        preview_opacity: float = 0.5,
+    ):
+        modified, reference = _paired_image_batches(modified, reference)
+        output_height = int(reference.shape[1])
+        output_width = int(reference.shape[2])
+
+        aligned_frames: list[torch.Tensor] = []
+        scale_xs: list[float] = []
+        scale_ys: list[float] = []
+        scores: list[float] = []
+        for index in range(modified.shape[0]):
+            stretch_x, stretch_y, score = _estimate_top_left_stretch(
+                modified[index],
+                reference[index],
+                search_percent,
+                coarse_steps,
+                fine_steps,
+            )
+            aligned_frames.append(
+                _resample_top_left(
+                    modified[index : index + 1],
+                    output_height,
+                    output_width,
+                    stretch_x,
+                    stretch_y,
+                    resampling,
+                    clamp_output=True,
+                )
+            )
+            scale_xs.append(stretch_x)
+            scale_ys.append(stretch_y)
+            scores.append(score)
+
+        aligned = torch.cat(aligned_frames, dim=0)
+        preview = _overlay_preview(aligned, reference, preview_mode, preview_opacity)
+        return (
+            aligned,
+            preview,
+            float(sum(scale_xs) / len(scale_xs)),
+            float(sum(scale_ys) / len(scale_ys)),
+            float(sum(scores) / len(scores)),
+        )
+
+
+class CKManualAlignSheetStretch:
+    """Manually adjust top-left anchored sheet stretch and preview overlap."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "modified": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "stretch_x": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.5,
+                        "max": 1.5,
+                        "step": 0.0005,
+                        "tooltip": (
+                            "Horizontal correction around the top-left origin. "
+                            "Values above 1 pull pixels from farther right, "
+                            "shrinking stretched content."
+                        ),
+                    },
+                ),
+                "stretch_y": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.5,
+                        "max": 1.5,
+                        "step": 0.0005,
+                        "tooltip": (
+                            "Vertical correction around the top-left origin. "
+                            "Values above 1 pull pixels from farther down, "
+                            "shrinking stretched content."
+                        ),
+                    },
+                ),
+                "resampling": (
+                    ["bilinear", "bicubic", "nearest"],
+                    {
+                        "default": "bilinear",
+                        "tooltip": "Interpolation used for the corrected output image.",
+                    },
+                ),
+                "preview_mode": (
+                    ["red/green overlap", "blend", "difference"],
+                    {
+                        "default": "red/green overlap",
+                        "tooltip": (
+                            "Preview style. Red/green shows reference in red, "
+                            "corrected image in green, and yellow where they overlap."
+                        ),
+                    },
+                ),
+                "preview_opacity": (
+                    "FLOAT",
+                    {
+                        "default": 0.5,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Opacity of the corrected image in blend preview mode.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("aligned", "overlay_preview")
+    FUNCTION = "adjust"
+    CATEGORY = CATEGORY
+    DESCRIPTION = (
+        "Manually correct a top-left anchored sheet stretch. Use the preview "
+        "output to compare the corrected image against the reference."
+    )
+
+    def adjust(
+        self,
+        modified: torch.Tensor,
+        reference: torch.Tensor,
+        stretch_x: float = 1.0,
+        stretch_y: float = 1.0,
+        resampling: str = "bilinear",
+        preview_mode: str = "red/green overlap",
+        preview_opacity: float = 0.5,
+    ):
+        modified, reference = _paired_image_batches(modified, reference)
+        aligned = _resample_top_left(
+            modified,
+            int(reference.shape[1]),
+            int(reference.shape[2]),
+            stretch_x,
+            stretch_y,
+            resampling,
+            clamp_output=True,
+        )
+        preview = _overlay_preview(aligned, reference, preview_mode, preview_opacity)
+        return (aligned, preview)
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1724,8 @@ NODE_CLASS_MAPPINGS = {
     "CKAnimationSelector": CKAnimationSelector,
     "CKFramesToSheet": CKFramesToSheet,
     "CKSheetToFrames": CKSheetToFrames,
+    "CKAutoAlignSheetStretch": CKAutoAlignSheetStretch,
+    "CKManualAlignSheetStretch": CKManualAlignSheetStretch,
     "CKPackAtlas": CKPackAtlas,
     "CKMergeEdits": CKMergeEdits,
     "CKSaveFramesDescriptor": CKSaveFramesDescriptor,
@@ -1192,6 +1739,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CKAnimationSelector": "CK Animation Selector",
     "CKFramesToSheet": "CK Frames to Sheet",
     "CKSheetToFrames": "CK Sheet to Frames",
+    "CKAutoAlignSheetStretch": "CK Auto Align Sheet Stretch",
+    "CKManualAlignSheetStretch": "CK Manual Align Sheet Stretch",
     "CKPackAtlas": "CK Pack Atlas",
     "CKMergeEdits": "CK Merge Edits",
     "CKSaveFramesDescriptor": "CK Save Frames Descriptor",

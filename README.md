@@ -68,21 +68,41 @@ a compact near-square grid automatically; set it to `1` for a vertical strip,
 or to the frame count for a horizontal strip. It outputs both the single
 `sheet` image and a `sheet_layout` descriptor.
 
-The sheet is transparently padded on its right and bottom edges so both its
-width and height are multiples of 16 and its total pixel count is between
-**655,360 and 8,294,400**. When the frame grid is smaller than the minimum, both
-canvas dimensions grow while approximately preserving the grid's aspect ratio.
-No frame pixels are resized or moved. If the aligned frame grid itself exceeds
-the maximum, the node reports an error because it cannot meet the limit without
-losing pixels; changing `columns`, reducing the frame count, or reducing the
-source frame size is then required.
+The sheet adds a transparent 16px gutter on the left and top before the frame
+grid starts. It is then transparently padded on the right and bottom as needed
+so both its width and height are multiples of 16 and its total pixel count is
+between **655,360 and 8,294,400**. When the padded frame grid is smaller than the
+minimum, both canvas dimensions grow while approximately preserving the grid's
+aspect ratio. No frame pixels are resized. If the aligned padded grid itself
+exceeds the maximum, the node reports an error because it cannot meet the limit
+without losing pixels; changing `columns`, reducing the frame count, or reducing
+the source frame size is then required.
 
 Connect both outputs to **CK Sheet to Frames** to recover the original ordered
 `IMAGE` batch. A direct combine/split round trip does not resize, colour-convert,
 or quantise pixels, so the recovered frames have exactly the same shape, dtype,
-device, ordering, and values as the selector output. If the sheet is resized or
-cropped between the two nodes, the splitter reports a clear shape-mismatch error
-instead of silently producing incorrect frames.
+device, ordering, and values as the selector output. If the sheet is resized
+between the two nodes, the splitter automatically resizes it back to the
+`sheet_layout` dimensions before slicing; channel-count mismatches still report
+an error because RGB/RGBA cannot be inferred safely.
+
+### CK Auto / Manual Align Sheet Stretch
+
+Use these when an edited spritesheet has the same overall proportions as the
+original sheet but its contents are slightly stretched from the top-left corner.
+
+**CK Auto Align Sheet Stretch** takes `modified` and `reference`, estimates the
+horizontal and vertical correction factors, and outputs an `aligned` image whose
+resolution exactly matches `reference`. It also outputs an `overlay_preview`
+plus the detected `stretch_x`, `stretch_y`, and `match_error`. The matcher uses
+alpha/edge structure instead of raw colour where possible, so recoloured sprites
+can still line up.
+
+**CK Manual Align Sheet Stretch** exposes `stretch_x` and `stretch_y` sliders for
+manual tuning. Values above `1.0` pull pixels from farther right/down, shrinking
+content that was stretched outward from the top-left origin. Connect
+`overlay_preview` to **Preview Image**: in the default red/green mode, the
+reference is red, the corrected image is green, and aligned areas become yellow.
 
 ### CK Pack Atlas
 Takes the (edited) `frames` + `ck_frames` and rebuilds the **entire** atlas:
